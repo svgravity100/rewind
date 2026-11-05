@@ -185,6 +185,10 @@ pub struct Tui {
     clips: Vec<Clip>,
     clips_dir: PathBuf,
     clip_state: ListState,
+    /// Clip lengths already read: path → (size, modified, seconds).
+    durations: std::collections::HashMap<PathBuf, (u64, std::time::SystemTime, Option<f64>)>,
+    /// When the clip folder was last read (it is re-read every few seconds).
+    last_scan: Instant,
     toast: Option<Toast>,
     /// Digits typed on the FPS or buffer-length row, applied with Enter.
     num_input: Option<(F, String)>,
@@ -223,6 +227,8 @@ impl Tui {
             clips: Vec::new(),
             clips_dir: PathBuf::new(),
             clip_state: ListState::default(),
+            durations: std::collections::HashMap::new(),
+            last_scan: Instant::now(),
             toast: None,
             num_input: None,
             hits: Vec::new(),
@@ -250,6 +256,12 @@ impl Tui {
                 if !hidden {
                     if was_hidden {
                         term.clear()?;
+                    }
+                    // Files deleted, renamed or added outside the program show
+                    // up within a couple of seconds (and right after the window
+                    // comes back from the tray).
+                    if was_hidden || self.last_scan.elapsed() >= Duration::from_secs(2) {
+                        self.scan_clips();
                     }
                     term.draw(|f| self.draw(f))?;
                 }
@@ -363,8 +375,10 @@ impl Tui {
     }
 
     fn scan_clips(&mut self) {
+        self.last_scan = Instant::now();
         let dir = self.settings().output_dir;
-        let mut v: Vec<(std::time::SystemTime, Clip)> = Vec::new();
+        // Names, sizes and dates first (cheap); lengths only for the newest.
+        let mut v: Vec<(std::time::SystemTime, PathBuf, u64)> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for e in rd.flatten() {
                 let p = e.path();
@@ -373,23 +387,29 @@ impl Tui {
                     continue;
                 }
                 let Ok(md) = e.metadata() else { continue };
-                v.push((
-                    md.modified().unwrap_or(std::time::UNIX_EPOCH),
-                    Clip {
-                        name: p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
-                        bytes: md.len(),
-                        secs: match ext.as_str() {
-                            "avi" => avi::avi_duration(&p),
-                            "mp4" => mf::mp4_duration(&p),
-                            _ => None,
-                        },
-                        path: p,
-                    },
-                ));
+                v.push((md.modified().unwrap_or(std::time::UNIX_EPOCH), p, md.len()));
             }
         }
         v.sort_by(|a, b| b.0.cmp(&a.0));
-        self.clips = v.into_iter().take(60).map(|x| x.1).collect();
+        v.truncate(60);
+        let mut clips = Vec::with_capacity(v.len());
+        let mut known = std::collections::HashMap::new();
+        for (modified, p, bytes) in v {
+            // A file's length is read once (opening each clip is the slow part).
+            let secs = match self.durations.get(&p) {
+                Some(&(b, m, s)) if b == bytes && m == modified => s,
+                _ => match p.extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+                    "avi" => avi::avi_duration(&p),
+                    "mp4" => mf::mp4_duration(&p),
+                    _ => None,
+                },
+            };
+            known.insert(p.clone(), (bytes, modified, secs));
+            clips.push(Clip { name: p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), bytes, secs, path: p });
+        }
+        // Forget files that are gone.
+        self.durations = known;
+        self.clips = clips;
         self.clips_dir = dir;
         let n = self.clips.len();
         match self.clip_state.selected() {
@@ -809,7 +829,7 @@ impl Tui {
         let today = util::stamp();
         let today = &today[..10];
         let items: Vec<ListItem> = if self.clips.is_empty() {
-            vec![ListItem::new(Line::styled("Пока пусто — сохранённые повторы появятся здесь", Style::new().fg(MUTED)))]
+            vec![ListItem::new(Line::styled("Пока пусто — сохранённые клипы появятся здесь", Style::new().fg(MUTED)))]
         } else {
             self.clips.iter().map(|c| ListItem::new(clip_line(c, today))).collect()
         };
