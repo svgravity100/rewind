@@ -65,8 +65,12 @@ pub struct ClipSpec {
     pub fps: u32,
     pub width: u32,
     pub height: u32,
-    /// Number of sound tracks (AVI uses only the first).
+    /// Number of sound tracks in the clip (AVI uses only the first).
     pub audio_tracks: u8,
+    /// Some(weights): the first clip track ("всё вместе") is not in the
+    /// buffer but summed from the stored tracks with these weights; clip
+    /// track k+1 is stored track k. None: clip tracks are stored as they are.
+    pub mix_weights: Option<Vec<f32>>,
 }
 
 pub struct ClipResult {

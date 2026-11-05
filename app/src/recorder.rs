@@ -52,6 +52,8 @@ pub struct Shared {
     pub level_sys: AtomicU32,
     pub level_chat: AtomicU32,
     pub level_mic: AtomicU32,
+    /// The voice chat is inside the game sound (per-app capture unavailable).
+    pub chat_in_game: AtomicBool,
     /// Voice-chat apps currently captured on their own track.
     pub chat_found: Mutex<Vec<String>>,
     pub error: Mutex<Option<String>>,
@@ -114,6 +116,10 @@ struct Spec {
     w: u32,
     h: u32,
     audio_tracks: u8,
+    /// Stored sound tracks when "всё вместе" is made at saving time
+    /// (1 game, 2 chat, 3 mic); n_parts 0: tracks stored as they are.
+    parts: [u8; 3],
+    n_parts: u8,
     format: Format,
     bitrate: u32,
     codec: Codec,
@@ -193,11 +199,23 @@ impl Pipeline {
             threads.push(std::thread::spawn(move || crate::audio::run(acfg, st, tx, t0, sh)));
         }
 
+        let stored = crate::audio::stored(&tracks);
+        let derived_mix = stored.len() < tracks.len();
+        let mut parts = [0u8; 3];
+        for (i, t) in stored.iter().take(3).enumerate() {
+            parts[i] = match t {
+                crate::audio::Track::Game => 1,
+                crate::audio::Track::Chat => 2,
+                _ => 3,
+            };
+        }
         let spec = Spec {
             fps: cfg.fps,
             w: cfg.out_w,
             h: cfg.out_h,
             audio_tracks: tracks.len() as u8,
+            parts,
+            n_parts: if derived_mix { stored.len() as u8 } else { 0 },
             format: cfg.format,
             bitrate: cfg.bitrate,
             codec: cfg.codec,
@@ -615,7 +633,12 @@ fn writer_thread(
                 close(&mut cur, &mut segs);
                 let list: Vec<Arc<Segment>> =
                     segs.iter().filter(|s| s.end_ms.load(Ordering::Relaxed) >= from_ms).cloned().collect();
-                let clip = avi::ClipSpec { from_ms, to_ms: now, fps: spec.fps, width: spec.w, height: spec.h, audio_tracks: spec.audio_tracks };
+                // "Всё вместе" = game + chat + mic (no chat when it is already in the game sound).
+                let mix_weights = (spec.n_parts > 0).then(|| {
+                    let chat_in_game = shared.chat_in_game.load(Ordering::Relaxed);
+                    spec.parts[..spec.n_parts as usize].iter().map(|&p| if p == 2 && chat_in_game { 0.0 } else { 1.0 }).collect()
+                });
+                let clip = avi::ClipSpec { from_ms, to_ms: now, fps: spec.fps, width: spec.w, height: spec.h, audio_tracks: spec.audio_tracks, mix_weights };
                 let ev = events.clone();
                 let sh = shared.clone();
                 sh.saving.fetch_add(1, Ordering::Relaxed);

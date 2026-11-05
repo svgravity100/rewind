@@ -452,7 +452,65 @@ type AacFrames = Receiver<Result<Mf<IMFSample>, String>>;
 
 /// Encode one sound track of the clip (positions `a0`..`limit`) to AAC,
 /// sending the frames (times relative to the clip start) as they come out.
-fn encode_track(aac: &Aac, segs: &[&SegRef], track: usize, a0: u64, limit: u64, tx: &Sender<Result<Mf<IMFSample>, String>>) -> Result<(), String> {
+/// Where one sound track of the clip comes from in the buffer.
+#[derive(Clone)]
+enum TrackSrc {
+    /// Stored as it is (index of the stored track).
+    Stored(u8),
+    /// "Всё вместе": not stored; summed from the stored tracks with these weights.
+    Mix(Vec<f32>),
+}
+
+fn track_src(spec: &crate::avi::ClipSpec, k: usize) -> TrackSrc {
+    match &spec.mix_weights {
+        Some(w) if k == 0 => TrackSrc::Mix(w.clone()),
+        Some(_) => TrackSrc::Stored(k as u8 - 1),
+        None => TrackSrc::Stored(k as u8),
+    }
+}
+
+fn to_pcm(acc: &[f32]) -> Vec<u8> {
+    acc.iter().flat_map(|v| (v.round().clamp(-32768.0, 32767.0) as i16).to_le_bytes()).collect()
+}
+
+/// The sound blocks (position, PCM) of one clip track in a buffer file.
+fn track_blocks(path: &Path, src: &TrackSrc, out: &mut dyn FnMut(u64, Vec<u8>)) -> Result<(), String> {
+    let audio = crate::avi::KIND_AUDIO;
+    match src {
+        TrackSrc::Stored(t) => crate::avi::for_each_record(path, |kd, pos, data| {
+            if kd == audio + t {
+                out(pos, data.to_vec());
+            }
+            Ok(())
+        }),
+        TrackSrc::Mix(w) => {
+            // The stored tracks are written block by block at the same
+            // positions, so blocks with equal positions are added together.
+            let mut cur: Option<(u64, Vec<f32>)> = None;
+            let r = crate::avi::for_each_record(path, |kd, pos, data| {
+                let t = kd.wrapping_sub(audio) as usize;
+                if kd < audio || t >= w.len() {
+                    return Ok(());
+                }
+                if cur.as_ref().is_some_and(|c| c.0 != pos || c.1.len() != data.len() / 2) {
+                    let (p, acc) = cur.take().unwrap();
+                    out(p, to_pcm(&acc));
+                }
+                let acc = &mut cur.get_or_insert_with(|| (pos, vec![0.0; data.len() / 2])).1;
+                for (i, s) in data.chunks_exact(2).enumerate() {
+                    acc[i] += i16::from_le_bytes([s[0], s[1]]) as f32 * w[t];
+                }
+                Ok(())
+            });
+            if let Some((p, acc)) = cur {
+                out(p, to_pcm(&acc));
+            }
+            r
+        }
+    }
+}
+
+fn encode_track(aac: &Aac, segs: &[&SegRef], src: &TrackSrc, a0: u64, limit: u64, tx: &Sender<Result<Mf<IMFSample>, String>>) -> Result<(), String> {
     let frame = 1024 * HNS / crate::audio::RATE as i64;
     let mut k = 0i64;
     let mut send = |s: IMFSample| -> Result<(), String> {
@@ -466,14 +524,8 @@ fn encode_track(aac: &Aac, segs: &[&SegRef], track: usize, a0: u64, limit: u64, 
         tx.send(Ok(Mf(s))).map_err(|_| "сохранение прервано".to_string())
     };
     let mut o = AudioOut::new(a0);
-    let kind = crate::avi::KIND_AUDIO + track as u8;
     for s in segs {
-        crate::avi::for_each_record(&s.audio, |kd, pos, data| {
-            if kd == kind {
-                o.q.push_back((pos, data.to_vec()));
-            }
-            Ok(())
-        })?;
+        track_blocks(&s.audio, src, &mut |pos, data| o.q.push_back((pos, data)))?;
         o.until(limit, &mut |smp| unsafe { aac.input(&smp, &mut send) })?;
     }
     unsafe { aac.finish(&mut send) }
@@ -530,16 +582,10 @@ struct Loaded {
 // thread and handed to the writing thread.
 unsafe impl Send for Loaded {}
 
-fn load_segment(s: &SegRef, base: i64, start: i64, end: i64, ntracks: usize) -> Result<Loaded, String> {
+fn load_segment(s: &SegRef, base: i64, start: i64, end: i64, srcs: &[TrackSrc]) -> Result<Loaded, String> {
     let mut l = Loaded { video: Vec::new(), pcm: Vec::new() };
-    if ntracks > 0 {
-        crate::avi::for_each_record(&s.audio, |kind, pos, data| {
-            let t = kind.wrapping_sub(crate::avi::KIND_AUDIO) as usize;
-            if kind >= crate::avi::KIND_AUDIO && t < ntracks {
-                l.pcm.push((t, pos, data.to_vec()));
-            }
-            Ok(())
-        })?;
+    for (k, src) in srcs.iter().enumerate() {
+        track_blocks(&s.audio, src, &mut |pos, data| l.pcm.push((k, pos, data)))?;
     }
     read_video(&s.mp4, |smp, ts, _| {
         let t = base + ts;
@@ -635,8 +681,12 @@ pub fn save_mp4(segs: &[SegRef], spec: &crate::avi::ClipSpec, out: &Path) -> Res
                 }
             }
         }
-        // Readers only bring the sound along when the writer encodes it.
-        let reader_tracks = if encs.is_empty() { ntracks } else { 0 };
+        // Where each clip track comes from in the buffer ("всё вместе" may be
+        // summed from the others). Readers only bring the sound along when
+        // the writer encodes it.
+        let srcs: Vec<TrackSrc> = (0..ntracks).map(|k| track_src(spec, k)).collect();
+        let reader_srcs: Vec<TrackSrc> = if encs.is_empty() { srcs.clone() } else { Vec::new() };
+        let reader_tracks = reader_srcs.len();
         sw.BeginWriting().map_err(e("Файл MP4"))?;
 
         let mut frames = 0u64;
@@ -652,24 +702,25 @@ pub fn save_mp4(segs: &[SegRef], spec: &crate::avi::ClipSpec, out: &Path) -> Res
         std::thread::scope(|sc| -> Result<(), String> {
             for (k, (aac, tx)) in encs.into_iter().enumerate() {
                 let segs = &segs;
+                let src = srcs[k].clone();
                 sc.spawn(move || {
                     let aac = aac;
                     com_init();
-                    if let Err(x) = encode_track(&aac.0, segs, k, a0, a_end, &tx) {
+                    if let Err(x) = encode_track(&aac.0, segs, &src, a0, a_end, &tx) {
                         let _ = tx.send(Err(x));
                     }
                 });
             }
             // Readers stay a few segments ahead of the writing.
             for _ in 0..workers {
-                let (next, slots, segs, rx) = (&next, &slots, &segs, ticket_rx.clone());
+                let (next, slots, segs, rx, reader_srcs) = (&next, &slots, &segs, ticket_rx.clone(), &reader_srcs);
                 sc.spawn(move || {
                     com_init();
                     while rx.recv().is_ok() {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(s) = segs.get(i) else { break };
                         let base = s.base_slot as i64 * HNS / fps;
-                        let _ = slots[i].0.send(load_segment(s, base, start, want_end, reader_tracks));
+                        let _ = slots[i].0.send(load_segment(s, base, start, want_end, reader_srcs));
                     }
                 });
             }
@@ -884,6 +935,47 @@ pub fn mp4_duration(p: &Path) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::AudioOut;
+
+    /// "Всё вместе" made at saving time is the weighted sum of the stored
+    /// tracks, block by block, clamped to 16 bits.
+    #[test]
+    fn mix_is_summed_from_stored_tracks() {
+        use super::{track_blocks, TrackSrc};
+        use crate::avi::{write_record, KIND_AUDIO};
+        let path = std::env::temp_dir().join(format!("rewind-mix-test-{}.buf", std::process::id()));
+        let block = |v: i16| v.to_le_bytes().repeat(4); // 4 samples
+        {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+            for pos in [0u64, 4] {
+                // game, chat, mic for each block, as the audio thread writes them
+                write_record(&mut f, KIND_AUDIO, pos, &block(1000)).unwrap();
+                write_record(&mut f, KIND_AUDIO + 1, pos, &block(200)).unwrap();
+                write_record(&mut f, KIND_AUDIO + 2, pos, &block(30000)).unwrap();
+            }
+        }
+        let mut got = Vec::new();
+        track_blocks(&path, &TrackSrc::Mix(vec![1.0, 1.0, 1.0]), &mut |pos, d| got.push((pos, d))).unwrap();
+        let mut no_chat = Vec::new();
+        track_blocks(&path, &TrackSrc::Mix(vec![1.0, 0.0, 0.0]), &mut |pos, d| no_chat.push((pos, d))).unwrap();
+        let mut chat = Vec::new();
+        track_blocks(&path, &TrackSrc::Stored(1), &mut |pos, d| chat.push((pos, d))).unwrap();
+        let _ = std::fs::remove_file(&path);
+        // 1000 + 200 + 30000 = 31200 (fits); game alone = 1000; stored chat unchanged.
+        assert_eq!(got, vec![(0, block(31200)), (4, block(31200))]);
+        assert_eq!(no_chat, vec![(0, block(1000)), (4, block(1000))]);
+        assert_eq!(chat, vec![(0, block(200)), (4, block(200))]);
+        // Clamped when the sum doesn't fit.
+        let mut loud = Vec::new();
+        let p2 = std::env::temp_dir().join(format!("rewind-mix-test2-{}.buf", std::process::id()));
+        {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&p2).unwrap());
+            write_record(&mut f, KIND_AUDIO, 0, &block(30000)).unwrap();
+            write_record(&mut f, KIND_AUDIO + 1, 0, &block(30000)).unwrap();
+        }
+        track_blocks(&p2, &TrackSrc::Mix(vec![1.0, 1.0]), &mut |pos, d| loud.push((pos, d))).unwrap();
+        let _ = std::fs::remove_file(&p2);
+        assert_eq!(loud, vec![(0, block(i16::MAX))]);
+    }
 
     /// Sound blocks with a gap: the gap is filled with silence and nothing
     /// goes past the limit.

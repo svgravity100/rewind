@@ -38,6 +38,17 @@ pub enum Track {
     Mic,
 }
 
+/// Which of a clip's tracks are kept in the buffer: all but "всё вместе",
+/// which is summed from the others when a clip is saved (a quarter less
+/// sound written to disk). A single track, or the mix alone, is kept as is.
+pub fn stored(clip: &[Track]) -> Vec<Track> {
+    if clip.len() > 1 && clip[0] == Track::Mix {
+        clip[1..].to_vec()
+    } else {
+        clip.to_vec()
+    }
+}
+
 /// Which tracks a clip gets, in file order.
 pub fn tracks(game: bool, chat: bool, mic: bool) -> Vec<Track> {
     let parts: Vec<Track> = [(game, Track::Game), (chat, Track::Chat), (mic, Track::Mic)]
@@ -204,6 +215,7 @@ fn to_i16(samples: &[f32]) -> Vec<u8> {
 pub fn run(cfg: AudioConfig, stop: Arc<AtomicBool>, tx: Sender<WriterMsg>, t0: Instant, shared: Arc<Shared>) {
     crate::util::time_critical();
     let order = if cfg.mix_only { vec![Track::Mix] } else { tracks(cfg.game, cfg.chat, cfg.mic) };
+    let stored = stored(&order);
     let own_pid = std::process::id();
     let mut game: Option<Source> = None;
     let mut game_fallback = false;
@@ -284,7 +296,10 @@ pub fn run(cfg: AudioConfig, stop: Arc<AtomicBool>, tx: Sender<WriterMsg>, t0: I
         shared.level_sys.store(peaks[0].to_bits(), Ordering::Relaxed);
         shared.level_chat.store(peaks[1].to_bits(), Ordering::Relaxed);
         shared.level_mic.store(peaks[2].to_bits(), Ordering::Relaxed);
-        for (i, t) in order.iter().enumerate() {
+        // The chat is inside the game sound in fallback: the mix made at
+        // saving time must then leave the chat track out.
+        shared.chat_in_game.store(game_fallback, Ordering::Relaxed);
+        for (i, t) in stored.iter().enumerate() {
             let data = match t {
                 Track::Game => to_i16(&g),
                 Track::Chat => to_i16(&c),

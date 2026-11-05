@@ -1147,7 +1147,9 @@ fn buffer_need(s: &Settings, monitors: &[MonitorInfo]) -> u64 {
     let (w, h) = s.resolution.output_size(m.width, m.height);
     let secs = s.buffer_minutes as u64 * 60;
     let pcm_per_track = audio::RATE as u64 * 4;
-    mf::bitrate(w, h, s.fps, s.quality, s.codec) as u64 / 8 * secs + pcm_per_track * 4 * secs
+    // "Всё вместе" is not kept in the buffer (made when saving).
+    let tracks = audio::stored(&audio::tracks(s.system_audio, s.chat_track, s.microphone)).len() as u64;
+    mf::bitrate(w, h, s.fps, s.quality, s.codec) as u64 / 8 * secs + pcm_per_track * tracks * secs
 }
 
 /// Not enough room for the buffer where it is kept? `used`: what the
