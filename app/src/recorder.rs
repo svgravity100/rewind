@@ -263,8 +263,17 @@ fn capture_thread(
     };
     // GPU mode: pictures stay on the video card and are converted there.
     let mut conv: Option<crate::gpu::Converter> = None;
+    let mut white = 1.0f32;
     if gpu {
         cap.gpu = true;
+        // HDR screen (or RB_FORCE_HDR for testing on a normal one): 16-bit capture,
+        // tone-mapped to normal colours on the video card.
+        let hdr_on = capture::is_hdr(&cfg.monitor);
+        if hdr_on || std::env::var_os("RB_FORCE_HDR").is_some() {
+            if cap.set_hdr(true).is_ok() {
+                white = if hdr_on { capture::sdr_white(&cfg.monitor) } else { 1.0 };
+            }
+        }
         match unsafe { crate::gpu::device_manager(cap.device()) } {
             Ok(m) => *shared.gpu_manager.lock().unwrap() = Some(mf::Mf(m)),
             Err(e) => {
@@ -319,7 +328,10 @@ fn capture_thread(
                     } else if let Some(latest) = cap.latest().cloned() {
                         if conv.as_ref().is_none_or(|c| c.in_w != cap.width || c.in_h != cap.height) {
                             match crate::gpu::Converter::new(cap.device(), cap.width, cap.height, w, h, cfg.fps) {
-                                Ok(c) => conv = Some(c),
+                                Ok(mut c) => {
+                                    c.white = white;
+                                    conv = Some(c)
+                                }
                                 Err(e) => {
                                     *shared.error.lock().unwrap() = Some(e);
                                     std::thread::sleep(Duration::from_millis(500));

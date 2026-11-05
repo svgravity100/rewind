@@ -50,6 +50,10 @@ pub struct Converter {
     /// CPU-readable square for the area under the pointer.
     patch: Option<(ID3D11Texture2D, u32, u32)>,
     patch_px: Vec<u8>,
+    /// HDR screen: turns the 16-bit float capture into normal colours first.
+    tonemap: Option<crate::hdr::Tonemap>,
+    /// scRGB value of SDR white on this screen (see `capture::sdr_white`).
+    pub white: f32,
 }
 
 impl Converter {
@@ -104,12 +108,33 @@ impl Converter {
                 composed,
                 patch: None,
                 patch_px: Vec::new(),
+                tonemap: None,
+                white: 1.0,
             })
         }
     }
 
     /// The picture to encode: the screen itself, or a copy with the pointer drawn in.
     pub fn compose(&mut self, screen: &ID3D11Texture2D, pointer: Option<&Pointer>) -> ID3D11Texture2D {
+        // HDR capture: tone-map to 8-bit first; everything after works on that.
+        let sdr;
+        let screen = if crate::hdr::is_float(screen) {
+            if self.tonemap.is_none() {
+                match crate::hdr::Tonemap::new(&self.device, self.in_w, self.in_h, self.white) {
+                    Ok(t) => self.tonemap = Some(t),
+                    Err(_) => return screen.clone(),
+                }
+            }
+            match self.tonemap.as_mut().unwrap().run(screen) {
+                Ok(t) => {
+                    sdr = t;
+                    &sdr
+                }
+                Err(_) => return screen.clone(),
+            }
+        } else {
+            screen
+        };
         let Some(p) = pointer.filter(|p| p.visible && !p.data.is_empty()) else { return screen.clone() };
         unsafe {
             let shape_h = if p.kind == 1 { p.h / 2 } else { p.h };
@@ -271,8 +296,35 @@ pub fn color_test(monitor: &crate::capture::MonitorInfo, dir: &std::path::Path) 
         v.write(&nv12, i)?;
     }
     v.finish()?;
+    // The same picture as an HDR screen shows it: linear light, SDR white at
+    // 2.5 (200 nits). After tone-mapping it must look like the others.
+    let white = 2.5f32;
+    let lin = |c: u8| {
+        let c = c as f32 / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    let mut fp = Vec::with_capacity((w * h * 4) as usize);
+    for p in px.chunks_exact(4) {
+        for v in [lin(p[2]) * white, lin(p[1]) * white, lin(p[0]) * white, 1.0] {
+            fp.push(f16_bits(v));
+        }
+    }
+    let hdr_src = unsafe {
+        let t = texture(cap.device(), w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_SHADER_RESOURCE.0 as u32)?;
+        cap.device().GetImmediateContext().map_err(err("Direct3D"))?.UpdateSubresource(&t, 0, None, fp.as_ptr() as *const _, w * 8, 0);
+        t
+    };
+    let mut hconv = Converter::new(cap.device(), w, h, w, h, fps)?;
+    hconv.white = white;
+    let hdr_file = dir.join("color-hdr.mp4");
+    let mut v = mf::VideoSegWriter::create_gpu(&hdr_file, w, h, fps, bitrate, &mgr)?;
+    for i in 0..30 {
+        let composed = hconv.compose(&hdr_src, Some(&pointer));
+        v.write_sample(&hconv.convert(&composed)?.0, i)?;
+    }
+    v.finish()?;
     let mut out = String::new();
-    for (name, file) in [("gpu", &gpu_file), ("cpu", &cpu_file)] {
+    for (name, file) in [("gpu", &gpu_file), ("cpu", &cpu_file), ("hdr", &hdr_file)] {
         let (fw, _, rgb) = mf::last_frame_bgra(file)?;
         let at = |x: u32, y: u32| {
             let o = ((y * fw + x) * 4) as usize;
@@ -286,6 +338,25 @@ pub fn color_test(monitor: &crate::capture::MonitorInfo, dir: &std::path::Path) 
         out.push_str(&format!(" pointer [255,0,255]->{:?}\n", at(38, 208)));
     }
     Ok(out)
+}
+
+/// f32 → IEEE half float bits (for building test pictures).
+fn f16_bits(v: f32) -> u16 {
+    let b = v.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32 - 127 + 15;
+    let man = b & 0x7f_ffff;
+    if exp <= 0 {
+        if exp < -10 {
+            return sign;
+        }
+        let m = (man | 0x80_0000) >> (1 - exp);
+        return sign | ((m + 0x1000) >> 13) as u16;
+    }
+    if exp >= 31 {
+        return sign | 0x7c00;
+    }
+    sign | ((exp as u32) << 10 | ((man + 0x1000) >> 13)) as u16
 }
 
 /// Check the whole GPU path on this PC: capture device, conversion, and the
@@ -310,5 +381,17 @@ pub fn probe(monitor: &crate::capture::MonitorInfo, dir: &std::path::Path, w: u3
         Ok(())
     } else {
         Err("пустой файл".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn half_floats() {
+        assert_eq!(super::f16_bits(0.0), 0x0000);
+        assert_eq!(super::f16_bits(1.0), 0x3c00);
+        assert_eq!(super::f16_bits(2.5), 0x4100);
+        assert_eq!(super::f16_bits(-2.0), 0xc000);
+        assert_eq!(super::f16_bits(0.5), 0x3800);
     }
 }

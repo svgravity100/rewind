@@ -107,12 +107,12 @@ impl Controller {
         let s = self.settings.lock().unwrap().clone();
         let p = self.pipeline.lock().unwrap();
         let Some(p) = p.as_ref() else {
-            let _ = self.events.send(AppEvent::Error("Буфер повтора выключен — включите его, чтобы сохранять моменты".into()));
+            let _ = self.events.send(AppEvent::Error("Буфер выключен — включите его, чтобы сохранять моменты".into()));
             return;
         };
         let secs = secs.unwrap_or(s.buffer_minutes as u64 * 60);
-        let out = util::unique_path(&s.output_dir, &format!("Повтор {}", util::stamp()), p.format.ext());
-        p.save_last(secs, out, "Повтор".into());
+        let out = util::unique_path(&s.output_dir, &format!("Rewind {}", util::stamp()), p.format.ext());
+        p.save_last(secs, out, "Клип".into());
     }
 
     /// Apply edited settings: update the live buffer length, and restart the

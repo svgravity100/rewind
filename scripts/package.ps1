@@ -33,6 +33,18 @@ if (-not $SkipBuild) {
 $exe = Join-Path $app "target\release\rewind.exe"
 if (-not (Test-Path $exe)) { throw "No $exe — build first" }
 
+# ---- code signing (only when a certificate is given: SIGN_PFX + SIGN_PASSWORD)
+function Sign-File($file) {
+    if (-not $env:SIGN_PFX) { return }
+    $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+        Sort-Object FullName | Select-Object -Last 1
+    if (-not $signtool) { throw "signtool.exe not found (Windows SDK)" }
+    & $signtool.FullName sign /f $env:SIGN_PFX /p $env:SIGN_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /d "Rewind" $file
+    if ($LASTEXITCODE -ne 0) { throw "signing $file failed" }
+    Write-Host "Signed: $file"
+}
+Sign-File $exe
+
 if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }
 New-Item -ItemType Directory -Force $dist | Out-Null
 
@@ -70,4 +82,6 @@ $ico = Get-ChildItem (Join-Path $app "target\release\build") -Recurse -Filter ap
 if (-not $ico) { throw "app.ico not found in the build output" }
 & $iscc "/DAppVersion=$Version" "/DSourceExe=$exe" "/DOutputDir=$dist" "/DIconFile=$($ico.FullName)" (Join-Path $root "installer\rewind.iss")
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
-Write-Host "Installer: $(Join-Path $dist "Rewind-$Version-setup.exe")"
+$setup = Join-Path $dist "Rewind-$Version-setup.exe"
+Sign-File $setup
+Write-Host "Installer: $setup"

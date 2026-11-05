@@ -9,6 +9,7 @@ mod autostart;
 mod avi;
 mod capture;
 mod gpu;
+mod hdr;
 mod icon;
 mod controller;
 mod mf;
@@ -17,6 +18,7 @@ mod overlay;
 mod recorder;
 mod settings;
 mod shell;
+mod sound;
 mod tray;
 mod tui;
 mod update;
@@ -88,8 +90,14 @@ fn main() {
     }
     if let Some(i) = args.iter().position(|a| a == "--toast-png") {
         let p = PathBuf::from(args.get(i + 1).cloned().unwrap_or_else(|| "toast.png".into()));
-        let _ = notify::render_png("Повтор сохранён", "00:44 · 51 МБ · Rewind", true, &p);
+        let _ = notify::render_png("Клип сохранён", "00:44 · 51 МБ · Rewind", true, &p);
         let _ = notify::render_png("Не удалось сохранить", "в буфере ещё нет кадров", false, &p.with_extension("err.png"));
+        return;
+    }
+    if args.iter().any(|a| a == "--hdr-info") {
+        for (i, m) in capture::list_monitors().iter().enumerate() {
+            println!("{}: {} hdr={}", i + 1, m.label(i), capture::is_hdr(m));
+        }
         return;
     }
     if args.iter().any(|a| a == "--update-check") {

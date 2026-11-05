@@ -1,4 +1,4 @@
-//! On-screen notice in the top-right corner of the recorded screen ("Повтор
+//! On-screen notice in the top-right corner of the recorded screen ("Клип
 //! сохранён · 00:44 · 51 МБ"), like the ShadowPlay overlay. A click-through,
 //! always-on-top window, excluded from capture so it never ends up in a clip.
 //! It fades out after a few seconds.

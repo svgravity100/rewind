@@ -66,6 +66,59 @@ pub fn list_monitors() -> Vec<MonitorInfo> {
     out
 }
 
+/// Whether Windows HDR is on for this screen (the desktop is then composed in
+/// a wide range that 8-bit capture shows washed out).
+pub fn is_hdr(monitor: &MonitorInfo) -> bool {
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else { return false };
+        let Ok(adapter) = factory.EnumAdapters1(monitor.adapter) else { return false };
+        let Ok(output) = adapter.EnumOutputs(monitor.output) else { return false };
+        let Ok(o6) = output.cast::<IDXGIOutput6>() else { return false };
+        o6.GetDesc1().is_ok_and(|d| d.ColorSpace == windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+    }
+}
+
+/// HDR screen: the scRGB value of white for normal (SDR) content, from the
+/// "SDR content brightness" slider in Windows (1.0 = 80 nits). 1.0 if unknown.
+pub fn sdr_white(monitor: &MonitorInfo) -> f32 {
+    use windows::Win32::Devices::Display::*;
+    unsafe {
+        let (mut np, mut nm) = (0u32, 0u32);
+        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm).is_err() {
+            return 1.0;
+        }
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
+        if QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &mut np, paths.as_mut_ptr(), &mut nm, modes.as_mut_ptr(), None).is_err() {
+            return 1.0;
+        }
+        for p in &paths[..np as usize] {
+            let mut src = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+            src.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            src.header.size = std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+            src.header.adapterId = p.sourceInfo.adapterId;
+            src.header.id = p.sourceInfo.id;
+            if DisplayConfigGetDeviceInfo(&mut src.header) != 0 {
+                continue;
+            }
+            let len = src.viewGdiDeviceName.iter().position(|&c| c == 0).unwrap_or(32);
+            if String::from_utf16_lossy(&src.viewGdiDeviceName[..len]) != monitor.name {
+                continue;
+            }
+            let mut wl = DISPLAYCONFIG_SDR_WHITE_LEVEL::default();
+            wl.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+            wl.header.size = std::mem::size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>() as u32;
+            wl.header.adapterId = p.targetInfo.adapterId;
+            wl.header.id = p.targetInfo.id;
+            if DisplayConfigGetDeviceInfo(&mut wl.header) == 0 && wl.SDRWhiteLevel > 0 {
+                // In thousandths of 80 nits.
+                return wl.SDRWhiteLevel as f32 / 1000.0;
+            }
+        }
+        1.0
+    }
+}
+
 #[derive(Default)]
 pub struct Pointer {
     pub visible: bool,
@@ -92,6 +145,8 @@ pub struct Capturer {
     latest: Option<ID3D11Texture2D>,
     /// GPU mode: pictures stay on the video card, `frame` is not filled.
     pub gpu: bool,
+    /// HDR screen: capture as 16-bit float (GPU mode only; see `hdr`).
+    hdr: bool,
     has_frame: bool,
     pub width: u32,
     pub height: u32,
@@ -127,6 +182,7 @@ impl Capturer {
                 frame: Vec::new(),
                 latest: None,
                 gpu: false,
+                hdr: false,
                 has_frame: false,
                 width: 0,
                 height: 0,
@@ -134,6 +190,19 @@ impl Capturer {
             c.reopen()?;
             Ok(c)
         }
+    }
+
+    /// Capture the screen as 16-bit float (HDR). Falls back to 8-bit on failure.
+    pub fn set_hdr(&mut self, on: bool) -> Result<(), String> {
+        self.hdr = on;
+        self.latest = None;
+        self.has_frame = false;
+        let r = self.reopen();
+        if r.is_err() && on {
+            self.hdr = false;
+            self.reopen()?;
+        }
+        r
     }
 
     pub fn device(&self) -> &ID3D11Device {
@@ -156,9 +225,13 @@ impl Capturer {
                 .EnumOutputs(self.monitor.output)
                 .map_err(|e| err("Экран", e))?;
             let output1: IDXGIOutput1 = output.cast().map_err(|e| err("Экран", e))?;
-            let dup = output1
-                .DuplicateOutput(&self.device)
-                .map_err(|e| err("Захват экрана", e))?;
+            let dup = if self.hdr {
+                let o5: IDXGIOutput5 = output.cast().map_err(|e| err("Экран", e))?;
+                o5.DuplicateOutput1(&self.device, 0, &[windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT])
+                    .map_err(|e| err("Захват экрана (HDR)", e))?
+            } else {
+                output1.DuplicateOutput(&self.device).map_err(|e| err("Захват экрана", e))?
+            };
             self.dup = Some(dup);
         }
         Ok(())

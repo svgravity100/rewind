@@ -261,3 +261,18 @@ pub fn cleanup() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::newer;
+
+    #[test]
+    fn compares_versions_by_number() {
+        assert!(newer("0.2.0", "0.1.0"));
+        assert!(newer("v0.10.0", "0.9.9"));
+        assert!(newer("1.0", "0.99.99"));
+        assert!(!newer("0.1.0", "0.1.0"));
+        assert!(!newer("0.1.0", "0.2.0"));
+        assert!(!newer("v0.1.0", "0.1"));
+    }
+}

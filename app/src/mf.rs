@@ -836,3 +836,35 @@ pub fn mp4_duration(p: &Path) -> Option<f64> {
         Some(d as f64 / 1e7)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::AudioOut;
+
+    /// Sound blocks with a gap: the gap is filled with silence and nothing
+    /// goes past the limit.
+    #[test]
+    fn audio_gaps_become_silence() {
+        super::startup().unwrap();
+        let mut o = AudioOut::new(1000);
+        o.q.push_back((1000, vec![1u8; 100 * 4]));
+        o.q.push_back((1300, vec![2u8; 100 * 4]));
+        let mut got: Vec<(i64, usize, u8)> = Vec::new();
+        o.until(1350, &mut |s| {
+            unsafe {
+                let b = s.ConvertToContiguousBuffer().unwrap();
+                let (mut p, mut n) = (std::ptr::null_mut(), 0u32);
+                b.Lock(&mut p, None, Some(&mut n)).unwrap();
+                got.push((s.GetSampleTime().unwrap(), n as usize / 4, *p));
+                b.Unlock().unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+        let total: usize = got.iter().map(|g| g.1).sum();
+        assert_eq!(total, 350, "{got:?}");
+        assert_eq!(got.first().unwrap().2, 1);
+        assert_eq!(got.last().unwrap().2, 2);
+        assert!(got.iter().any(|g| g.2 == 0), "silence expected in the gap: {got:?}");
+    }
+}

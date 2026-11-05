@@ -155,6 +155,7 @@ enum F {
     Autostart,
     CheckUpdates,
     Update,
+    SaveSound,
     /// A group heading inside a list (not selectable).
     Group(&'static str),
 }
@@ -317,12 +318,18 @@ impl Tui {
                         detail.push(dir.to_string_lossy().into_owned());
                     }
                     crate::notify::post(title, detail.join(" · "), true);
+                    if self.settings().sound_on_save {
+                        crate::sound::saved();
+                    }
                     self.say(text, OK);
                     self.scan_clips();
                 }
                 AppEvent::Error(e) => {
                     if e.starts_with("Не удалось сохранить") {
                         crate::notify::post("Не удалось сохранить", e.trim_start_matches("Не удалось сохранить").trim_start_matches(':').trim(), false);
+                        if self.settings().sound_on_save {
+                            crate::sound::failed();
+                        }
                     }
                     self.say(e, REC)
                 }
@@ -552,6 +559,7 @@ impl Tui {
             }
             F::Mic => s.microphone = !s.microphone,
             F::CheckUpdates => s.check_updates = !s.check_updates,
+            F::SaveSound => s.sound_on_save = !s.sound_on_save,
             F::Update => {
                 match crate::update::state() {
                     crate::update::State::Available(_) => crate::update::install(),
@@ -802,7 +810,7 @@ impl Tui {
             let [a, b] = Layout::vertical([Constraint::Min(5), Constraint::Length(6)]).areas(area);
             (a, Some(b))
         } else {
-            let [a, b] = Layout::vertical([Constraint::Min(5), Constraint::Length(4)]).areas(area);
+            let [a, b] = Layout::vertical([Constraint::Min(5), Constraint::Length(3)]).areas(area);
             if let Some(fl) = selected {
                 let (label, _) = self.row(fl, s, &failed);
                 f.render_widget(
@@ -923,7 +931,7 @@ impl Tui {
         }
         self.sel[self.page_idx()] = idx;
         self.num_input = None;
-        let switch = matches!(f, F::CheckUpdates | F::Update | F::Autostart | F::Replay | F::Game | F::Chat | F::ChatApp(_) | F::Mic | F::XEnabled);
+        let switch = matches!(f, F::SaveSound | F::CheckUpdates | F::Update | F::Autostart | F::Replay | F::Game | F::Chat | F::ChatApp(_) | F::Mic | F::XEnabled);
         let rel = col as i32 - (MARK_W + LABEL_W) as i32;
         if rel < 0 {
             // On the label: switches flip, other rows just get selected.
@@ -1008,7 +1016,7 @@ impl Tui {
             }
             F::Mic => ("Микрофон".into(), vec![on(s.microphone)]),
             F::Folder => ("Папка".into(), plain(s.output_dir.display().to_string())),
-            F::HkSave => ("Сохранить повтор".into(), hk(s.hk_save, Action::SaveReplay)),
+            F::HkSave => ("Сохранить клип".into(), hk(s.hk_save, Action::SaveReplay)),
             F::HkToggle => ("Буфер вкл/выкл".into(), hk(s.hk_toggle, Action::ToggleReplay)),
             F::XEnabled => ("Прицел".into(), vec![on(s.crosshair_enabled)]),
             F::XKind => ("Вид".into(), plain(format!("‹ {} ›", s.crosshair_kind.label()))),
@@ -1022,6 +1030,7 @@ impl Tui {
             F::HkCross => ("Прицел вкл/выкл".into(), hk(s.hk_crosshair, Action::ToggleCrosshair)),
             F::Autostart => ("Запуск с Windows".into(), vec![on(crate::autostart::enabled())]),
             F::CheckUpdates => ("Проверять обновления".into(), vec![on(s.check_updates)]),
+            F::SaveSound => ("Звук при сохранении".into(), vec![on(s.sound_on_save)]),
             F::Update => ("Обновление".into(), update_value()),
             F::Group(name) => (name.into(), Vec::new()),
         }
@@ -1043,6 +1052,7 @@ fn fields(page: Page) -> Vec<F> {
             Group("ЗВУК"),
             Game,
             Mic,
+            SaveSound,
             Group("ПАПКА И КЛАВИШИ"),
             Folder,
             HkSave,
@@ -1095,8 +1105,9 @@ fn hint(f: F) -> &'static str {
         F::XColor => "Цвет прицела.",
         F::HkCross => "Включить или выключить прицел из любой игры.",
         F::Autostart => "Запускать Rewind при входе в Windows, сразу свёрнутым в трей.",
-        F::CheckUpdates => "Раз в несколько часов смотреть, вышла ли новая версия на GitHub, и сообщать об этом.",
-        F::Update => "Enter — проверить сейчас или установить новую версию. Программа закроется и запустится уже обновлённой.",
+        F::SaveSound => "Короткий сигнал после сохранения — слышно и в полноэкранной игре. В запись не попадает.",
+        F::CheckUpdates => "Раз в несколько часов проверять, вышла ли новая версия, и сообщать об этом.",
+        F::Update => "Enter — проверить сейчас или установить новую версию; Rewind перезапустится обновлённым.",
         F::Chat | F::ChatApp(_) | F::Group(_) => "",
     }
 }
@@ -1116,13 +1127,15 @@ fn step(fields: &[F], i: usize, d: i32) -> usize {
     }
 }
 
-/// A clip row: "сегодня 23:53   Повтор   20:00    4.98 ГБ".
+/// A clip row: "сегодня 23:53   Клип   20:00    4.98 ГБ".
 fn clip_line(c: &Clip, today: &str) -> Line<'static> {
     let dur = c.secs.map(|x| util::fmt_clock((x * 1000.0) as u64)).unwrap_or_default();
     let size = util::fmt_bytes(c.bytes);
-    // Names look like "Повтор 2026-11-04 23-53-37".
+    // Names look like "Rewind 2026-11-04 23-53-37".
     let mut parts = c.name.splitn(3, ' ');
     let (kind, date, time) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    // "Rewind …" now, "Повтор …" before the rename: both are clips.
+    let kind = if kind == "Rewind" || kind == "Повтор" { "Клип" } else { kind };
     let (day, hm) = match (date.get(5..7), date.get(8..10), time.get(..5)) {
         (Some(mo), Some(d), Some(hm)) if date.len() == 10 => {
             (if date == today { "сегодня".to_string() } else { format!("{d}.{mo}") }, hm.replace('-', ":"))
@@ -1154,4 +1167,35 @@ fn fkey(k: u8, dir: i32) -> u8 {
 fn next_mods(m: Mods) -> Mods {
     let i = Mods::ALL.iter().position(|&x| x == m).unwrap_or(0);
     Mods::ALL[(i + 1) % Mods::ALL.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clip_line, step, Clip, F};
+    use std::path::PathBuf;
+
+    fn text(c: &Clip, today: &str) -> String {
+        clip_line(c, today).spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn clip_rows_show_date_time_and_kind() {
+        let c = Clip { path: PathBuf::new(), name: "Rewind 2026-11-05 17-48-03".into(), bytes: 970_000_000, secs: Some(313.0) };
+        let t = text(&c, "2026-11-05");
+        assert!(t.starts_with("сегодня   17:48"), "{t}");
+        assert!(t.contains("Клип") && t.contains("05:13") && t.contains("970 МБ"), "{t}");
+        // Clips from before the rename are clips too.
+        let old = Clip { name: "Повтор 2026-11-04 23-53-37".into(), ..c };
+        let t = text(&old, "2026-11-05");
+        assert!(t.starts_with("04.11") && t.contains("Клип"), "{t}");
+    }
+
+    #[test]
+    fn selection_skips_group_headings() {
+        let f = [F::Group("A"), F::Replay, F::Group("B"), F::Mic];
+        assert_eq!(step(&f, 1, 1), 3);
+        assert_eq!(step(&f, 3, -1), 1);
+        assert_eq!(step(&f, 1, -1), 1); // nothing selectable above
+        assert_eq!(step(&f, 3, 1), 3);
+    }
 }
