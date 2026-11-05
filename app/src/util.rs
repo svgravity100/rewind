@@ -91,10 +91,13 @@ pub fn open_path(p: &Path) {
     let _ = std::process::Command::new("explorer").arg(p).spawn();
 }
 
+/// Open the clip's folder in Explorer with the clip selected.
 pub fn reveal(p: &Path) {
-    let _ = std::process::Command::new("explorer")
-        .arg(format!("/select,{}", p.display()))
-        .spawn();
+    // Explorer wants `/select,"path"` as is: passed as one argument, Rust
+    // quotes the whole thing (the names have spaces) and Explorer then
+    // ignores it and opens Documents.
+    use std::os::windows::process::CommandExt;
+    let _ = std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", p.display())).spawn();
 }
 
 pub fn fmt_clock(ms: u64) -> String {
