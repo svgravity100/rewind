@@ -19,6 +19,7 @@ mod settings;
 mod shell;
 mod tray;
 mod tui;
+mod update;
 mod util;
 
 use controller::{Controller, QUIT};
@@ -91,6 +92,10 @@ fn main() {
         let _ = notify::render_png("Не удалось сохранить", "в буфере ещё нет кадров", false, &p.with_extension("err.png"));
         return;
     }
+    if args.iter().any(|a| a == "--update-check") {
+        println!("{}", update::report());
+        return;
+    }
     if args.iter().any(|a| a == "--render") {
         // Print the three pages as text, without recording or a console UI.
         let (tx, rx) = crossbeam_channel::unbounded::<AppEvent>();
@@ -141,6 +146,8 @@ fn main() {
         std::mem::forget(mutex);
         // Keep "start with Windows" pointing at this copy of the program.
         autostart::refresh();
+        // After a portable update: remove the previous .exe.
+        update::cleanup();
         // Physical pixels everywhere: the overlay is placed by DXGI coordinates.
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = SetConsoleOutputCP(65001);
@@ -199,6 +206,10 @@ fn main() {
     }
     if settings.replay_enabled {
         ctrl.start_now();
+    }
+    {
+        let c = ctrl.clone();
+        update::start_auto(move || c.settings.lock().unwrap().check_updates);
     }
     let failed: shell::Failed = Arc::default();
     let shell = shell::start(ctrl.clone(), hide_hwnd, failed.clone());

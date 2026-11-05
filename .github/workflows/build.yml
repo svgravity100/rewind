@@ -43,6 +43,15 @@ jobs:
           }
           "version=$v" >> $env:GITHUB_OUTPUT
 
+      - name: Tag matches the program version
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $cargo = (Select-String -Path app/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($cargo -ne "${{ steps.ver.outputs.version }}") {
+            throw "Tag ${{ github.ref_name }} does not match app/Cargo.toml version $cargo — the update check compares them. Bump Cargo.toml first."
+          }
+
       - name: Build and package
         shell: pwsh
         run: ./scripts/package.ps1 -Version "${{ steps.ver.outputs.version }}" -RequireInstaller

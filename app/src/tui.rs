@@ -153,6 +153,8 @@ enum F {
     XColor,
     HkCross,
     Autostart,
+    CheckUpdates,
+    Update,
     /// A group heading inside a list (not selectable).
     Group(&'static str),
 }
@@ -424,6 +426,11 @@ impl Tui {
                 }
             }
             KeyCode::Char('q') | KeyCode::Char('й') => QUIT.store(true, Ordering::SeqCst),
+            KeyCode::Char('u') | KeyCode::Char('г') => {
+                if matches!(crate::update::state(), crate::update::State::Available(_)) {
+                    crate::update::install();
+                }
+            }
             KeyCode::Esc => {
                 if self.console != 0 {
                     tray::hide(self.console);
@@ -544,6 +551,15 @@ impl Tui {
                 }
             }
             F::Mic => s.microphone = !s.microphone,
+            F::CheckUpdates => s.check_updates = !s.check_updates,
+            F::Update => {
+                match crate::update::state() {
+                    crate::update::State::Available(_) => crate::update::install(),
+                    crate::update::State::Downloading(_) | crate::update::State::Installing | crate::update::State::Checking => {}
+                    _ => crate::update::check_now(false),
+                }
+                return;
+            }
             F::Autostart => {
                 let on = !crate::autostart::enabled();
                 match crate::autostart::set(on) {
@@ -610,6 +626,20 @@ impl Tui {
             x += w + 1;
         }
         f.render_widget(Paragraph::new(Line::from(spans)), head);
+        // A newer version: shown on the right of the header on every page.
+        let badge = match crate::update::state() {
+            crate::update::State::Available(r) => Some(format!("↑ есть Rewind {} — нажмите U ", r.version)),
+            crate::update::State::Downloading(p) => Some(format!("↑ обновление… {p}% ")),
+            crate::update::State::Installing => Some("↑ устанавливаю обновление… ".to_string()),
+            _ => None,
+        };
+        if let Some(b) = badge {
+            let w = (b.chars().count() as u16).min(head.width);
+            f.render_widget(
+                Paragraph::new(Span::styled(b, Style::new().fg(Color::Black).bg(ACCENT).bold())),
+                Rect::new(head.x + head.width - w, head.y, w, 1),
+            );
+        }
 
         match self.page {
             Page::Main => self.draw_main(f, body, &s, running),
@@ -893,7 +923,7 @@ impl Tui {
         }
         self.sel[self.page_idx()] = idx;
         self.num_input = None;
-        let switch = matches!(f, F::Autostart | F::Replay | F::Game | F::Chat | F::ChatApp(_) | F::Mic | F::XEnabled);
+        let switch = matches!(f, F::CheckUpdates | F::Update | F::Autostart | F::Replay | F::Game | F::Chat | F::ChatApp(_) | F::Mic | F::XEnabled);
         let rel = col as i32 - (MARK_W + LABEL_W) as i32;
         if rel < 0 {
             // On the label: switches flip, other rows just get selected.
@@ -991,6 +1021,8 @@ impl Tui {
             }),
             F::HkCross => ("Прицел вкл/выкл".into(), hk(s.hk_crosshair, Action::ToggleCrosshair)),
             F::Autostart => ("Запуск с Windows".into(), vec![on(crate::autostart::enabled())]),
+            F::CheckUpdates => ("Проверять обновления".into(), vec![on(s.check_updates)]),
+            F::Update => ("Обновление".into(), update_value()),
             F::Group(name) => (name.into(), Vec::new()),
         }
     }
@@ -1017,9 +1049,29 @@ fn fields(page: Page) -> Vec<F> {
             HkToggle,
             Group("СИСТЕМА"),
             Autostart,
+            CheckUpdates,
+            Update,
         ],
         Page::Voice => [Chat, Group("ПРОГРАММЫ")].into_iter().chain((0..audio::CHAT_APPS.len()).map(ChatApp)).collect(),
         Page::Crosshair => vec![XEnabled, Group("ВИД"), XKind, XSize, XThick, XColor, Group("КЛАВИША"), HkCross],
+    }
+}
+
+/// The "Обновление" row: current version and what the updater is doing.
+fn update_value() -> Vec<Span<'static>> {
+    use crate::update::State;
+    let cur = crate::update::current();
+    match crate::update::state() {
+        State::Idle => vec![Span::raw(format!("v{cur}")), Span::styled("  Enter — проверить", Style::new().fg(MUTED))],
+        State::Checking => vec![Span::raw(format!("v{cur}")), Span::styled("  проверяю…", Style::new().fg(MUTED))],
+        State::UpToDate => vec![Span::raw(format!("v{cur}")), Span::styled("  последняя версия", Style::new().fg(OK))],
+        State::Available(r) => vec![
+            Span::styled(format!("есть v{}", r.version), Style::new().fg(ACCENT).bold()),
+            Span::styled("  Enter или U — обновить", Style::new().fg(MUTED)),
+        ],
+        State::Downloading(p) => vec![Span::styled(format!("скачиваю… {p}%"), Style::new().fg(ACCENT))],
+        State::Installing => vec![Span::styled("устанавливаю — Rewind перезапустится", Style::new().fg(ACCENT))],
+        State::Failed(e) => vec![Span::styled(format!("не вышло: {e}"), Style::new().fg(WARN)), Span::styled("  Enter — ещё раз", Style::new().fg(MUTED))],
     }
 }
 
@@ -1043,6 +1095,8 @@ fn hint(f: F) -> &'static str {
         F::XColor => "Цвет прицела.",
         F::HkCross => "Включить или выключить прицел из любой игры.",
         F::Autostart => "Запускать Rewind при входе в Windows, сразу свёрнутым в трей.",
+        F::CheckUpdates => "Раз в несколько часов смотреть, вышла ли новая версия на GitHub, и сообщать об этом.",
+        F::Update => "Enter — проверить сейчас или установить новую версию. Программа закроется и запустится уже обновлённой.",
         F::Chat | F::ChatApp(_) | F::Group(_) => "",
     }
 }

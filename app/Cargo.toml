@@ -37,6 +37,9 @@ tray-icon = "0.19"
 ratatui = "0.29"
 crossterm = "0.28"
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Updates: GitHub API over HTTPS, and the portable zip.
+ureq = { version = "2", features = ["json"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [profile.release]
 opt-level = 3

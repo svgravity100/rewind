@@ -168,6 +168,8 @@ pub struct Settings {
     pub hk_save: Hotkey,
     pub hk_toggle: Hotkey,
     pub hk_crosshair: Hotkey,
+    /// Look for a newer version on GitHub at start-up and every few hours.
+    pub check_updates: bool,
     /// Missing in old files → 0, which triggers the migration in `load`.
     #[serde(default)]
     pub version: u32,
@@ -202,6 +204,7 @@ impl Default for Settings {
             hk_save: Hotkey { mods: Mods::CtrlAlt, key: 10 },
             hk_toggle: Hotkey { mods: Mods::CtrlShift, key: 10 },
             hk_crosshair: Hotkey { mods: Mods::CtrlShift, key: 9 },
+            check_updates: true,
             version: 2,
         }
     }

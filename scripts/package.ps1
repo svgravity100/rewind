@@ -30,7 +30,7 @@ if (-not $SkipBuild) {
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
     } finally { Pop-Location }
 }
-$exe = Join-Path $app "target\releaseewind.exe"
+$exe = Join-Path $app "target\release\rewind.exe"
 if (-not (Test-Path $exe)) { throw "No $exe — build first" }
 
 if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }
@@ -47,7 +47,7 @@ Rewind $Version — портативная версия
 Запуск: Rewind.exe. Установка не нужна.
 Настройки хранятся в этой же папке (settings.json), потому что рядом лежит файл "portable".
 Удалите файл "portable", чтобы настройки хранились в %APPDATA%\ReplayBuffer.
-Клипы по умолчанию сохраняются в папку ВидеоRewind (меняется в настройках).
+Клипы по умолчанию сохраняются в папку Видео\Rewind (меняется в настройках).
 "@
 $zip = Join-Path $dist "Rewind-$Version-portable.zip"
 Compress-Archive -Path $stage -DestinationPath $zip
@@ -68,6 +68,6 @@ if (-not $iscc) {
 # The app icon is drawn by build.rs; take the .ico it wrote.
 $ico = Get-ChildItem (Join-Path $app "target\release\build") -Recurse -Filter app.ico | Sort-Object LastWriteTime | Select-Object -Last 1
 if (-not $ico) { throw "app.ico not found in the build output" }
-& $iscc "/DAppVersion=$Version" "/DSourceExe=$exe" "/DOutputDir=$dist" "/DIconFile=$($ico.FullName)" (Join-Path $root "installerewind.iss")
+& $iscc "/DAppVersion=$Version" "/DSourceExe=$exe" "/DOutputDir=$dist" "/DIconFile=$($ico.FullName)" (Join-Path $root "installer\rewind.iss")
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
 Write-Host "Installer: $(Join-Path $dist "Rewind-$Version-setup.exe")"

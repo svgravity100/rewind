@@ -1,12 +1,12 @@
 ﻿; Installer for Rewind (Inno Setup 6). Built by scripts/package.ps1:
-;   ISCC /DAppVersion=0.1.0 /DSourceExe=...Rewind.exe /DOutputDir=...\dist installerewind.iss
+;   ISCC /DAppVersion=0.1.0 /DSourceExe=...\Rewind.exe /DOutputDir=...\dist installer\rewind.iss
 ; Installs for the current user only (no administrator rights needed).
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
 #endif
 #ifndef SourceExe
-  #define SourceExe "..\app\target\releaseewind.exe"
+  #define SourceExe "..\app\target\release\rewind.exe"
 #endif
 #ifndef OutputDir
   #define OutputDir "..\dist"
@@ -65,3 +65,5 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+; After a silent update (started by the program itself): start the new version.
+Filename: "{app}\{#AppExe}"; Flags: nowait postinstall skipifnotsilent
