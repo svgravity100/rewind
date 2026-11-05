@@ -1,0 +1,54 @@
+[package]
+name = "rewind"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_SystemInformation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Media_MediaFoundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_UI_Shell",
+    "Win32_System_Registry",
+] }
+wasapi = "0.26"
+crossbeam-channel = "0.5"
+jpeg-encoder = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+global-hotkey = "0.6"
+rfd = "0.15"
+tray-icon = "0.19"
+ratatui = "0.29"
+crossterm = "0.28"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+opt-level = 3
+# Smaller, faster .exe for the installer and the portable zip.
+lto = "thin"
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[build-dependencies]
+embed-resource = "3"

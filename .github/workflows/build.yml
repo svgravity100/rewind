@@ -1,0 +1,65 @@
+# Builds Rewind on Windows and packs an installer and a portable zip.
+#  - every push / pull request: build + packages as downloadable artifacts
+#  - a tag like v0.2.0: the same, published as a GitHub Release
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # creating releases on tags
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup --no-progress -y
+          }
+
+      - name: Version
+        id: ver
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $v = "${{ github.ref_name }}".TrimStart("v")
+          } else {
+            $v = (Select-String -Path app/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Build and package
+        shell: pwsh
+        run: ./scripts/package.ps1 -Version "${{ steps.ver.outputs.version }}" -RequireInstaller
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Rewind-${{ steps.ver.outputs.version }}
+          path: |
+            dist/*.exe
+            dist/*.zip
+          if-no-files-found: error
+
+      - name: Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.exe
+            dist/*.zip
+          generate_release_notes: true
