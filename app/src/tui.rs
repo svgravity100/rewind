@@ -704,6 +704,12 @@ impl Tui {
             _ => "↑↓ · ←→ или клик по ‹ › · Enter — переключить · Esc — в трей",
         };
         f.render_widget(Paragraph::new(Span::styled(format!(" {keys}"), Style::new().fg(MUTED))), foot);
+        // The program's version in the bottom-right corner.
+        f.render_widget(
+            Paragraph::new(Span::styled(format!("v{} ", env!("CARGO_PKG_VERSION")), Style::new().fg(LINE)))
+                .alignment(ratatui::layout::Alignment::Right),
+            foot,
+        );
 
         // Console without 24-bit colour: use the nearest of the 16 standard
         // ones, so green stays green instead of dropping to no colour at all.
