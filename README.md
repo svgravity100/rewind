@@ -29,8 +29,6 @@
 
 ## Сборка
 
-Нужны [Rust](https://rustup.rs) (MSVC) и Windows SDK (для иконки в `.exe`).
-
 ```powershell
 cd app
 cargo build --release
