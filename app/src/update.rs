@@ -85,7 +85,15 @@ fn latest() -> Result<Option<Release>, String> {
     {
         Ok(r) => r,
         Err(ureq::Error::Status(404, _)) => return Ok(None),
-        Err(e) => return Err(format!("нет связи с GitHub ({e})")),
+        Err(ureq::Error::Status(403 | 429, _)) => return Err("GitHub временно ограничил проверки".into()),
+        Err(ureq::Error::Status(code, _)) => return Err(format!("GitHub ответил ошибкой {code}")),
+        Err(ureq::Error::Transport(t)) => {
+            return Err(match t.kind() {
+                ureq::ErrorKind::Dns | ureq::ErrorKind::ConnectionFailed => "нет интернета".into(),
+                ureq::ErrorKind::Io => "связь оборвалась".into(),
+                _ => "нет связи с GitHub".into(),
+            })
+        }
     };
     let v: serde_json::Value = resp.into_json().map_err(|e| format!("ответ GitHub не прочитан ({e})"))?;
     let tag = v["tag_name"].as_str().ok_or("в релизе нет версии")?;
@@ -141,10 +149,26 @@ pub fn start_auto(enabled: impl Fn() -> bool + Send + 'static) {
     std::thread::spawn(move || {
         // Let the program settle first.
         let mut next = Instant::now() + Duration::from_secs(10);
+        // After a failed check (e.g. no network yet right after Windows starts):
+        // try again sooner, 1, 5, then 15 minutes later.
+        let retries = [60u64, 300, 900];
+        let mut failed = 0usize;
+        let mut was_checking = false;
         while !QUIT.load(Ordering::Relaxed) {
+            let st = state();
+            if was_checking && !matches!(st, State::Checking) {
+                was_checking = false;
+                if matches!(st, State::Failed(_)) {
+                    next = Instant::now() + Duration::from_secs(retries[failed.min(retries.len() - 1)]);
+                    failed += 1;
+                } else {
+                    failed = 0;
+                }
+            }
             if Instant::now() >= next {
-                if enabled() && !matches!(state(), State::Available(_) | State::Downloading(_) | State::Installing) {
+                if enabled() && !matches!(st, State::Available(_) | State::Downloading(_) | State::Installing) {
                     check_now(true);
+                    was_checking = true;
                 }
                 next = Instant::now() + CHECK_EVERY;
             }

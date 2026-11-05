@@ -25,7 +25,9 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 AppPublisher={#AppName}
-DefaultDirName={localappdata}\ProgramsRewind
+DefaultDirName={localappdata}\Programs\Rewind
+; 0.1.0–0.2.0 installed to "ProgramsRewind" by mistake: always use the right folder.
+UsePreviousAppDir=no
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
@@ -51,6 +53,10 @@ Name: "autostart"; Description: "Запускать вместе с Windows (с�
 
 [Files]
 Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "{#AppExe}"; Flags: ignoreversion
+
+[InstallDelete]
+; The wrongly named folder of 0.1.0–0.2.0 (the program there is closed before setup runs).
+Type: filesandordirs; Name: "{localappdata}\ProgramsRewind"
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"

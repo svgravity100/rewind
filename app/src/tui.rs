@@ -324,10 +324,8 @@ impl Tui {
                     if let Some(dir) = path.parent().and_then(|d| d.file_name()) {
                         detail.push(dir.to_string_lossy().into_owned());
                     }
+                    // The sound already played when saving started.
                     crate::notify::post(title, detail.join(" · "), true);
-                    if self.settings().sound_on_save {
-                        crate::sound::saved();
-                    }
                     self.say(text, OK);
                     self.scan_clips();
                 }
