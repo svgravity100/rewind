@@ -21,6 +21,10 @@ fn err(what: &str) -> impl Fn(windows::core::Error) -> String + '_ {
 /// Lets Media Foundation (the encoder) use the capture device's textures.
 pub unsafe fn device_manager(device: &ID3D11Device) -> Result<IMFDXGIDeviceManager, String> {
     mf::startup()?;
+    // The game comes first on the video card; our copies and conversions after it.
+    if let Ok(d) = device.cast::<windows::Win32::Graphics::Dxgi::IDXGIDevice>() {
+        let _ = d.SetGPUThreadPriority(-4);
+    }
     // The encoder works on the device from its own threads.
     if let Ok(mt) = device.cast::<ID3D11Multithread>() {
         let _ = mt.SetMultithreadProtected(true);

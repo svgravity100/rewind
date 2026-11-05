@@ -265,6 +265,7 @@ fn capture_thread(
     writer_tx: Sender<WriterMsg>,
     t0: Instant,
 ) {
+    crate::util::time_critical();
     let mut cap = match Capturer::new(&cfg.monitor) {
         Ok(c) => c,
         Err(e) => {
@@ -300,9 +301,24 @@ fn capture_thread(
     let mut dirty = false;
     let mut last_sent = Instant::now() - Duration::from_secs(10);
     let mut fps_window = (Instant::now(), 0u64);
+    let mut last_change = Instant::now();
     while !stop.load(Ordering::Relaxed) {
+        // Still screen: instead of asking 60 times a second, wait (up to 100 ms,
+        // and not past the once-a-second refresh) for Windows to hand over a
+        // new picture. While things move, take the latest one once per frame.
+        let idle = last_change.elapsed() > Duration::from_millis(500);
+        let wait_ms = if idle {
+            let to_refresh = Duration::from_secs(1).saturating_sub(last_sent.elapsed());
+            (to_refresh.as_millis() as u32).clamp(1, 100)
+        } else {
+            0
+        };
+        let got = cap.grab(wait_ms);
         let slot = (t0.elapsed().as_secs_f64() * fps) as u64;
-        match cap.grab(0) {
+        if matches!(got, Ok(true)) {
+            last_change = Instant::now();
+        }
+        match got {
             Ok(true) if gpu => {
                 have = true;
                 dirty = true;
@@ -398,10 +414,12 @@ fn capture_thread(
             shared.fps_x10.store((fps_window.1 as f64 * 10.0 / el) as u64, Ordering::Relaxed);
             fps_window = (Instant::now(), 0);
         }
-        let next = t0 + Duration::from_secs_f64((slot + 1) as f64 / fps);
-        let now = Instant::now();
-        if next > now {
-            std::thread::sleep(next - now);
+        if !idle {
+            let next = t0 + Duration::from_secs_f64((slot + 1) as f64 / fps);
+            let now = Instant::now();
+            if next > now {
+                std::thread::sleep(next - now);
+            }
         }
     }
 }

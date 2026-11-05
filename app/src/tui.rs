@@ -242,10 +242,19 @@ impl Tui {
         let mut term = ratatui::init();
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
         let res = (|| -> std::io::Result<()> {
+            let mut was_hidden = false;
             while !QUIT.load(Ordering::Relaxed) {
                 self.handle_app_events();
-                term.draw(|f| self.draw(f))?;
-                if event::poll(Duration::from_millis(250))? {
+                // Hidden in the tray: nothing to draw. Back on screen: repaint it all.
+                let hidden = self.console != 0 && !tray::is_visible(self.console);
+                if !hidden {
+                    if was_hidden {
+                        term.clear()?;
+                    }
+                    term.draw(|f| self.draw(f))?;
+                }
+                was_hidden = hidden;
+                if event::poll(Duration::from_millis(if hidden { 500 } else { 250 }))? {
                     match event::read()? {
                         Event::Key(k) if k.kind == KeyEventKind::Press => self.key(k),
                         Event::Mouse(m) => self.mouse(m),
@@ -735,7 +744,7 @@ impl Tui {
                         let total = p.shared.buffer_secs.load(Ordering::Relaxed) * mf::bitrate(p.out_w, p.out_h, p.fps, s.quality, p.codec) as u64 / 8;
                         let codec = if p.codec == Codec::Hevc { "HEVC" } else { "H.264" };
                         Line::styled(
-                            format!("{}×{} · {} к/с · {} · {codec} · ≈ {} ", p.out_w, p.out_h, p.fps, s.quality.label(), util::fmt_bytes(total)),
+                            format!("{}×{} · {} к/с · {} · {codec} · до ≈ {} ", p.out_w, p.out_h, p.fps, s.quality.label(), util::fmt_bytes(total)),
                             Style::new().fg(MUTED),
                         )
                     };
@@ -1038,7 +1047,7 @@ impl Tui {
                 if let Some(m) = self.ctrl.monitors.get(s.monitor) {
                     let (w, h) = s.resolution.output_size(m.width, m.height);
                     let total = mf::bitrate(w, h, s.fps, s.quality, s.codec) as f64 / 8.0 * s.buffer_minutes as f64 * 60.0;
-                    v.push(Span::styled(format!("  ≈ {} на {} мин", util::fmt_bytes(total as u64), s.buffer_minutes), Style::new().fg(MUTED)));
+                    v.push(Span::styled(format!("  до ≈ {} на {} мин", util::fmt_bytes(total as u64), s.buffer_minutes), Style::new().fg(MUTED)));
                 }
                 v
             }),
@@ -1180,7 +1189,7 @@ fn hint(f: F) -> &'static str {
         F::Monitor => "Какой экран записывать.",
         F::Fps => "Кадров в секунду в клипе. Больше — плавнее, но тяжелее для диска и процессора.",
         F::Resolution => "Размер картинки в клипе. Меньше — файлы легче.",
-        F::Quality => "Чем выше, тем чётче картинка и больше файл.",
+        F::Quality => "Чем выше, тем чётче картинка и больше файл. Размер — верхняя оценка: спокойные сцены весят меньше.",
         F::Game => "Звук игры и всего компьютера.",
         F::Mic => "Ваш микрофон, на своей дорожке в клипе.",
         F::Folder => "Куда сохраняются клипы. Enter или щелчок — выбрать другую папку.",

@@ -98,6 +98,7 @@ fn spawn_source(target: Target) -> Source {
     let failed: Arc<Mutex<Option<String>>> = Arc::default();
     let (q2, s2, f2) = (q.clone(), stop.clone(), failed.clone());
     std::thread::spawn(move || {
+        crate::util::time_critical();
         let _ = wasapi::initialize_mta();
         let run = || -> Result<(), wasapi::WasapiError> {
             let client = open_client(target)?;
@@ -201,6 +202,7 @@ fn to_i16(samples: &[f32]) -> Vec<u8> {
 }
 
 pub fn run(cfg: AudioConfig, stop: Arc<AtomicBool>, tx: Sender<WriterMsg>, t0: Instant, shared: Arc<Shared>) {
+    crate::util::time_critical();
     let order = if cfg.mix_only { vec![Track::Mix] } else { tracks(cfg.game, cfg.chat, cfg.mic) };
     let own_pid = std::process::id();
     let mut game: Option<Source> = None;

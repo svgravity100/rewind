@@ -119,3 +119,20 @@ pub fn fmt_bytes(b: u64) -> String {
         format!("{:.0} КБ", b / 1e3)
     }
 }
+
+/// The whole program runs below normal priority so a game gets the CPU first;
+/// threads that must keep up in real time (capture of picture and sound)
+/// call `time_critical` to stay at the normal level inside that.
+pub fn lower_process_priority() {
+    use windows::Win32::System::Threading::{GetCurrentProcess, SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS};
+    unsafe {
+        let _ = SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+    }
+}
+
+pub fn time_critical() {
+    use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST};
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    }
+}

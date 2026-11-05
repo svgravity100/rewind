@@ -11,7 +11,7 @@ use crate::settings::Codec;
 use std::mem::ManuallyDrop;
 use crossbeam_channel::{Receiver, Sender};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
-use windows::core::{GUID, HSTRING};
+use windows::core::{Interface, GUID, HSTRING};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
@@ -141,7 +141,19 @@ impl VideoSegWriter {
             let inp = video_type(&MFVideoFormat_NV12, w, h, fps).map_err(e("NV12"))?;
             inp.SetUINT32(&MF_MT_DEFAULT_STRIDE, w).map_err(e("NV12"))?;
             let _ = inp.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32);
-            sw.SetInputMediaType(stream, &inp, None).map_err(e("Кодировщик H.264"))?;
+            // Variable bitrate: `bitrate` on average, up to 1.5× in busy scenes,
+            // and far less when little moves (constant bitrate would pad still
+            // scenes up to the full rate). Encoders that refuse it keep their own.
+            let mut params: Option<IMFAttributes> = None;
+            if MFCreateAttributes(&mut params, 3).is_ok() {
+                let p = params.as_ref().unwrap();
+                let _ = p.SetUINT32(&CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32);
+                let _ = p.SetUINT32(&CODECAPI_AVEncCommonMeanBitRate, bitrate);
+                let _ = p.SetUINT32(&CODECAPI_AVEncCommonMaxBitRate, bitrate.saturating_mul(3) / 2);
+            }
+            if sw.SetInputMediaType(stream, &inp, params.as_ref()).is_err() {
+                sw.SetInputMediaType(stream, &inp, None).map_err(e("Кодировщик H.264"))?;
+            }
             sw.BeginWriting().map_err(e("Кодировщик H.264"))?;
             Ok(Self { w: sw, stream, fps })
         }
@@ -153,6 +165,27 @@ impl VideoSegWriter {
         unsafe {
             let s = sample_from(nv12, t, dur).map_err(e("Кадр"))?;
             self.w.WriteSample(self.stream, &s).map_err(e("Кадр"))
+        }
+    }
+
+    /// Testing: the rate control mode the encoder actually uses
+    /// (0 constant, 1 variable with a peak, 2 variable, 3 quality).
+    pub fn rate_mode(&self) -> Option<u32> {
+        unsafe {
+            let ex: IMFSinkWriterEx = self.w.cast().ok()?;
+            for i in 0..8 {
+                let mut cat = GUID::zeroed();
+                let mut t: Option<IMFTransform> = None;
+                if ex.GetTransformForStream(self.stream, i, Some(&mut cat), &mut t).is_err() {
+                    break;
+                }
+                if let Some(api) = t.and_then(|t| t.cast::<ICodecAPI>().ok()) {
+                    if let Ok(v) = api.GetValue(&CODECAPI_AVEncCommonRateControlMode) {
+                        return u32::try_from(&v).ok();
+                    }
+                }
+            }
+            None
         }
     }
 
@@ -181,6 +214,9 @@ pub fn probe(dir: &Path, w: u32, h: u32, fps: u32, bitrate: u32, codec: Codec) -
     let frame = vec![128u8; (w * h * 3 / 2) as usize];
     for i in 0..3 {
         v.write(&frame, i)?;
+    }
+    if std::env::var_os("RB_RATE_MODE").is_some() {
+        println!("encoder rate control mode: {:?} (1 = variable with a peak)", v.rate_mode());
     }
     let r = v.finish();
     let _ = std::fs::remove_file(&p);

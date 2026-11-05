@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::Foundation::HWND;
-use windows::Win32::UI::WindowsAndMessaging::{IsIconic, SetForegroundWindow, ShowWindow, SW_HIDE, SW_RESTORE, SW_SHOW};
+use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_HIDE, SW_RESTORE, SW_SHOW};
 
 thread_local! {
     // TrayIcon is not Send; it stays on the shell thread, where its events arrive too.
@@ -19,6 +19,11 @@ thread_local! {
 }
 
 /// Hide the console window (0 = no window to hide).
+/// Is the window on screen (not hidden to the tray, not minimised)?
+pub fn is_visible(hwnd: isize) -> bool {
+    unsafe { IsWindowVisible(HWND(hwnd as *mut _)).as_bool() && !IsIconic(HWND(hwnd as *mut _)).as_bool() }
+}
+
 pub fn hide(hwnd: isize) {
     if hwnd != 0 {
         unsafe {

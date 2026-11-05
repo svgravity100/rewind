@@ -204,6 +204,8 @@ fn main() {
         }
     }
 
+    // A game gets the CPU first (capture threads raise themselves back).
+    util::lower_process_priority();
     mf::com_init();
     let settings = Settings::load();
     let (tx, rx) = crossbeam_channel::unbounded::<AppEvent>();
@@ -302,6 +304,7 @@ unsafe extern "system" fn on_console_event(kind: u32) -> BOOL {
 }
 
 fn selftest(secs: u64, dir: PathBuf) {
+    util::lower_process_priority();
     let mut s = Settings::load();
     s.output_dir = std::path::absolute(&dir).unwrap_or(dir);
     s.replay_enabled = true;
