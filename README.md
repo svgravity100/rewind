@@ -2,8 +2,6 @@
 
 Буфер повтора для Windows в духе NVIDIA ShadowPlay: программа всё время пишет последние минуты экрана и звука, а по горячей клавише сохраняет их в MP4.
 
-*A lightweight Windows replay buffer: always records the last N minutes of your screen and sound and saves them to MP4 on a hotkey.*
-
 ![Rewind](docs/images/demo.gif)
 
 ## Возможности
@@ -19,16 +17,6 @@
 - **Окно в терминале** в зелёном стиле, управляется мышью и клавиатурой; сворачивается в трей.
 - **Автозапуск с Windows** сразу в трей.
 - **Портативная версия:** настройки рядом с программой.
-
-## Как выглядит
-
-| Главная | Настройки |
-|---|---|
-| ![Главная](docs/images/main.png) | ![Настройки](docs/images/settings.png) |
-
-| Прицел | Уведомление о сохранении |
-|---|---|
-| ![Прицел](docs/images/crosshair.png) | ![Уведомление](docs/images/notice.png) |
 
 ## Установка
 
