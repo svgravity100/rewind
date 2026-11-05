@@ -33,7 +33,9 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(settings: Settings, events: Sender<AppEvent>) -> Self {
-        let _ = std::fs::remove_dir_all(util::temp_root()); // leftovers from a crash
+        // Leftovers from a crash (default place and the chosen one).
+        let _ = std::fs::remove_dir_all(util::buffer_root(&None));
+        let _ = std::fs::remove_dir_all(util::buffer_root(&settings.buffer_dir));
         Self {
             settings: Mutex::new(settings),
             pipeline: Mutex::new(None),
@@ -54,13 +56,14 @@ impl Controller {
             out_w,
             out_h,
             quality: s.quality.jpeg(),
-            bitrate: crate::mf::bitrate(out_w, out_h, s.fps, s.quality),
+            bitrate: crate::mf::bitrate(out_w, out_h, s.fps, s.quality, s.codec),
+            codec: s.codec,
             format: s.format,
             game_audio: s.system_audio,
             chat_track: s.chat_track,
             chat_apps: s.chat_apps.clone(),
             mic: s.microphone,
-            temp_dir: util::temp_root().join(format!("{}-{n}", std::process::id())),
+            temp_dir: util::buffer_root(&s.buffer_dir).join(format!("{}-{n}", std::process::id())),
             key: s.capture_key(),
         })
     }

@@ -314,6 +314,12 @@ fn selftest(secs: u64, dir: PathBuf) {
     if let Some(m) = std::env::var("RB_MINUTES").ok().and_then(|v| v.parse().ok()) {
         s.buffer_minutes = m;
     }
+    if std::env::var_os("RB_HEVC").is_some() {
+        s.codec = settings::Codec::Hevc;
+    }
+    if let Some(d) = std::env::var_os("RB_BUFFER_DIR") {
+        s.buffer_dir = Some(PathBuf::from(d));
+    }
     if std::env::var("RB_MIC").is_ok() {
         s.microphone = true;
     }
@@ -325,7 +331,7 @@ fn selftest(secs: u64, dir: PathBuf) {
     if let Some(p) = ctrl.pipeline.lock().unwrap().as_ref() {
         let sh = &p.shared;
         println!(
-            "buffered {} ms, disk {} B, sent {}, dropped {}, err {:?}, audio {:?}, fps {}, gpu {}, tracks {:?}, chat {:?}, note {:?}",
+            "buffered {} ms, disk {} B, sent {}, dropped {}, err {:?}, audio {:?}, fps {}, gpu {}, codec {:?}, tracks {:?}, chat {:?}, note {:?}",
             sh.buffered_ms.load(Ordering::Relaxed),
             sh.disk_bytes.load(Ordering::Relaxed),
             sh.frames_sent.load(Ordering::Relaxed),
@@ -334,6 +340,7 @@ fn selftest(secs: u64, dir: PathBuf) {
             sh.audio_note.lock().unwrap(),
             p.fps,
             p.gpu,
+            p.codec,
             p.tracks,
             sh.chat_found.lock().unwrap(),
             sh.format_note.lock().unwrap()

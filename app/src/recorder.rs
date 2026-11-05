@@ -8,7 +8,7 @@
 use crate::avi;
 use crate::capture::{self, Capturer, MonitorInfo};
 use crate::mf;
-use crate::settings::Format;
+use crate::settings::{Codec, Format};
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use std::collections::VecDeque;
 use std::fs::{self, File};
@@ -73,6 +73,7 @@ pub struct PipelineConfig {
     pub out_h: u32,
     pub quality: u8,
     pub bitrate: u32,
+    pub codec: Codec,
     pub format: Format,
     pub game_audio: bool,
     pub chat_track: bool,
@@ -95,6 +96,7 @@ pub struct Pipeline {
     pub out_w: u32,
     #[allow(dead_code)]
     pub out_h: u32,
+    pub codec: crate::settings::Codec,
     pub format: Format,
     /// Frames go capture → encoder on the video card (MP4 only).
     pub gpu: bool,
@@ -114,6 +116,7 @@ struct Spec {
     audio_tracks: u8,
     format: Format,
     bitrate: u32,
+    codec: Codec,
 }
 
 impl Pipeline {
@@ -125,13 +128,19 @@ impl Pipeline {
         if cfg.format == Format::Mp4 {
             // Probe on a worker thread: the UI thread is a COM STA (set up by the
             // window system), and Media Foundation objects made there misbehave.
-            // Then check whether frames can stay on the video card (much less CPU).
+            // HEVC first if chosen (falls back to H.264 when the video card can't),
+            // then check whether frames can stay on the video card (much less CPU).
             let probe = std::thread::scope(|s| {
                 s.spawn(|| {
                     mf::com_init();
-                    mf::probe(&cfg.temp_dir, cfg.out_w, cfg.out_h, cfg.fps, cfg.bitrate)?;
+                    if cfg.codec == Codec::Hevc && mf::probe(&cfg.temp_dir, cfg.out_w, cfg.out_h, cfg.fps, cfg.bitrate, Codec::Hevc).is_err() {
+                        cfg.codec = Codec::H264;
+                        cfg.bitrate = (cfg.bitrate as f64 / 0.6) as u32;
+                        *shared.format_note.lock().unwrap() = Some("HEVC этой видеокартой не поддерживается — пишу в H.264".into());
+                    }
+                    mf::probe(&cfg.temp_dir, cfg.out_w, cfg.out_h, cfg.fps, cfg.bitrate, cfg.codec)?;
                     Ok::<bool, String>(std::env::var_os("RB_NOGPU").is_none()
-                        && crate::gpu::probe(&cfg.monitor, &cfg.temp_dir, cfg.out_w, cfg.out_h, cfg.fps, cfg.bitrate).is_ok())
+                        && crate::gpu::probe(&cfg.monitor, &cfg.temp_dir, cfg.out_w, cfg.out_h, cfg.fps, cfg.bitrate, cfg.codec).is_ok())
                 })
                 .join()
                 .unwrap_or_else(|_| Err("сбой проверки".into()))
@@ -191,6 +200,7 @@ impl Pipeline {
             audio_tracks: tracks.len() as u8,
             format: cfg.format,
             bitrate: cfg.bitrate,
+            codec: cfg.codec,
         };
         let writer = {
             let sh = shared.clone();
@@ -218,6 +228,7 @@ impl Pipeline {
             fps: spec.fps,
             out_w: spec.w,
             out_h: spec.h,
+            codec: spec.codec,
             format: spec.format,
             gpu,
             tracks,
@@ -544,9 +555,9 @@ fn writer_thread(
                     if c.vw.is_none() {
                         let path = c.seg.mp4.as_ref().unwrap();
                         let made = match (&frame, shared.gpu_manager.lock().unwrap().as_ref()) {
-                            (Err(_), Some(m)) => mf::VideoSegWriter::create_gpu(path, spec.w, spec.h, spec.fps, spec.bitrate, &m.0),
+                            (Err(_), Some(m)) => mf::VideoSegWriter::create_gpu(path, spec.w, spec.h, spec.fps, spec.bitrate, spec.codec, &m.0),
                             (Err(_), None) => Err("нет видеокарты для кодировщика".into()),
-                            (Ok(_), _) => mf::VideoSegWriter::create(path, spec.w, spec.h, spec.fps, spec.bitrate),
+                            (Ok(_), _) => mf::VideoSegWriter::create(path, spec.w, spec.h, spec.fps, spec.bitrate, spec.codec),
                         };
                         match made {
                             Ok(v) => {
@@ -626,6 +637,10 @@ fn writer_thread(
     }
     drop(segs);
     let _ = fs::remove_dir(&dir);
+    // And the "RewindBuffer" folder itself once no buffer uses it (only if empty).
+    if let Some(parent) = dir.parent() {
+        let _ = fs::remove_dir(parent);
+    }
 }
 
 fn save_clip(list: &[Arc<Segment>], clip: &avi::ClipSpec, format: Format, out: &PathBuf, what: String, ev: &Sender<AppEvent>) {

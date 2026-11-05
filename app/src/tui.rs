@@ -4,7 +4,7 @@
 use crate::capture::MonitorInfo;
 use crate::controller::{Action, Controller, QUIT};
 use crate::recorder::AppEvent;
-use crate::settings::{CrosshairKind, Hotkey, Mods, Quality, Resolution, Settings, FPS_MAX, FPS_MIN, MINUTES_MAX, MINUTES_MIN};
+use crate::settings::{Codec, CrosshairKind, Hotkey, Mods, Quality, Resolution, Settings, FPS_MAX, FPS_MIN, MINUTES_MAX, MINUTES_MIN};
 use crate::shell::Failed;
 use crate::{audio, avi, mf, tray, util};
 use crossbeam_channel::Receiver;
@@ -156,6 +156,8 @@ enum F {
     CheckUpdates,
     Update,
     SaveSound,
+    VideoCodec,
+    BufferDir,
     /// A group heading inside a list (not selectable).
     Group(&'static str),
 }
@@ -285,6 +287,11 @@ impl Tui {
 
     fn settings(&self) -> Settings {
         self.ctrl.settings.lock().unwrap().clone()
+    }
+
+    /// Disk space the running buffer takes now.
+    fn buffer_used(&self) -> u64 {
+        self.ctrl.pipeline.lock().unwrap().as_ref().map_or(0, |p| p.shared.disk_bytes.load(Ordering::Relaxed))
     }
 
     fn running(&self) -> bool {
@@ -512,6 +519,21 @@ impl Tui {
                 let i = Resolution::ALL.iter().position(|&r| r == s.resolution).unwrap_or(0);
                 s.resolution = Resolution::ALL[cycle(i, Resolution::ALL.len(), dir)];
             }
+            F::VideoCodec => {
+                let i = Codec::ALL.iter().position(|&c| c == s.codec).unwrap_or(0);
+                s.codec = Codec::ALL[cycle(i, Codec::ALL.len(), dir)];
+            }
+            F::BufferDir => {
+                // The Windows temp folder, then every other internal disk.
+                let system = util::drive_of(&std::env::temp_dir());
+                let mut opts: Vec<Option<PathBuf>> = vec![None];
+                opts.extend(util::fixed_drives().into_iter().filter(|d| util::drive_of(d) != system).map(Some));
+                let i = opts.iter().position(|o| *o == s.buffer_dir);
+                s.buffer_dir = match i {
+                    Some(i) => opts[cycle(i, opts.len(), dir)].clone(),
+                    None => opts[0].clone(),
+                };
+            }
             F::Quality => {
                 let i = Quality::ALL.iter().position(|&q| q == s.quality).unwrap_or(0);
                 s.quality = Quality::ALL[cycle(i, Quality::ALL.len(), dir)];
@@ -577,6 +599,17 @@ impl Tui {
                 return;
             }
             F::XEnabled => s.crosshair_enabled = !s.crosshair_enabled,
+            F::BufferDir => {
+                let start = util::buffer_root(&s.buffer_dir).parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                let picked = std::thread::spawn(move || rfd::FileDialog::new().set_directory(&start).pick_folder())
+                    .join()
+                    .ok()
+                    .flatten();
+                match picked {
+                    Some(d) => s.buffer_dir = Some(d),
+                    None => return,
+                }
+            }
             F::Folder => {
                 // The folder dialog wants its own (STA) thread.
                 let start = s.output_dir.clone();
@@ -698,10 +731,13 @@ impl Tui {
                         Line::styled(format!("Ошибка: {e} "), Style::new().fg(REC))
                     } else if let Some(n) = note {
                         Line::styled(format!("Внимание: {n} "), Style::new().fg(WARN))
+                    } else if let Some(w) = space_warning(s, &self.ctrl.monitors, sh.disk_bytes.load(Ordering::Relaxed)) {
+                        Line::styled(format!("{w} "), Style::new().fg(WARN))
                     } else {
-                        let total = p.shared.buffer_secs.load(Ordering::Relaxed) * mf::bitrate(p.out_w, p.out_h, p.fps, s.quality) as u64 / 8;
+                        let total = p.shared.buffer_secs.load(Ordering::Relaxed) * mf::bitrate(p.out_w, p.out_h, p.fps, s.quality, p.codec) as u64 / 8;
+                        let codec = if p.codec == Codec::Hevc { "HEVC" } else { "H.264" };
                         Line::styled(
-                            format!("{}×{} · {} к/с · {} · ≈ {} ", p.out_w, p.out_h, p.fps, s.quality.label(), util::fmt_bytes(total)),
+                            format!("{}×{} · {} к/с · {} · {codec} · ≈ {} ", p.out_w, p.out_h, p.fps, s.quality.label(), util::fmt_bytes(total)),
                             Style::new().fg(MUTED),
                         )
                     };
@@ -1003,7 +1039,7 @@ impl Tui {
                 let mut v = vec![Span::raw(format!("‹ {} ›", s.quality.label()))];
                 if let Some(m) = self.ctrl.monitors.get(s.monitor) {
                     let (w, h) = s.resolution.output_size(m.width, m.height);
-                    let total = mf::bitrate(w, h, s.fps, s.quality) as f64 / 8.0 * s.buffer_minutes as f64 * 60.0;
+                    let total = mf::bitrate(w, h, s.fps, s.quality, s.codec) as f64 / 8.0 * s.buffer_minutes as f64 * 60.0;
                     v.push(Span::styled(format!("  ≈ {} на {} мин", util::fmt_bytes(total as u64), s.buffer_minutes), Style::new().fg(MUTED)));
                 }
                 v
@@ -1031,6 +1067,8 @@ impl Tui {
             F::Autostart => ("Запуск с Windows".into(), vec![on(crate::autostart::enabled())]),
             F::CheckUpdates => ("Проверять обновления".into(), vec![on(s.check_updates)]),
             F::SaveSound => ("Звук при сохранении".into(), vec![on(s.sound_on_save)]),
+            F::VideoCodec => ("Кодек".into(), plain(format!("‹ {} ›", s.codec.label()))),
+            F::BufferDir => ("Место для буфера".into(), buffer_dir_value(s, &self.ctrl.monitors, self.buffer_used())),
             F::Update => ("Обновление".into(), update_value()),
             F::Group(name) => (name.into(), Vec::new()),
         }
@@ -1049,6 +1087,8 @@ fn fields(page: Page) -> Vec<F> {
             Fps,
             Resolution,
             Quality,
+            VideoCodec,
+            BufferDir,
             Group("ЗВУК"),
             Game,
             Mic,
@@ -1065,6 +1105,55 @@ fn fields(page: Page) -> Vec<F> {
         Page::Voice => [Chat, Group("ПРОГРАММЫ")].into_iter().chain((0..audio::CHAT_APPS.len()).map(ChatApp)).collect(),
         Page::Crosshair => vec![XEnabled, Group("ВИД"), XKind, XSize, XThick, XColor, Group("КЛАВИША"), HkCross],
     }
+}
+
+/// Bytes the full buffer takes on disk: the video, plus the sound kept as
+/// raw PCM until saving (up to four tracks).
+fn buffer_need(s: &Settings, monitors: &[MonitorInfo]) -> u64 {
+    let Some(m) = monitors.get(s.monitor).or(monitors.first()) else { return 0 };
+    let (w, h) = s.resolution.output_size(m.width, m.height);
+    let secs = s.buffer_minutes as u64 * 60;
+    let pcm_per_track = audio::RATE as u64 * 4;
+    mf::bitrate(w, h, s.fps, s.quality, s.codec) as u64 / 8 * secs + pcm_per_track * 4 * secs
+}
+
+/// Not enough room for the buffer where it is kept? `used`: what the
+/// running buffer already takes there (it counts as available).
+fn space_warning(s: &Settings, monitors: &[MonitorInfo], used: u64) -> Option<String> {
+    let root = util::buffer_root(&s.buffer_dir);
+    let free = util::free_space(&root)? + used;
+    let need = buffer_need(s, monitors);
+    // A clip saved to the same disk needs about as much again.
+    let same_disk = util::drive_of(&root) == util::drive_of(&s.output_dir);
+    let want = if same_disk { need * 2 } else { need };
+    (free < want).then(|| {
+        format!(
+            "Мало места на {} — свободно {}, буферу {} мин нужно ≈ {}{}",
+            util::drive_of(&root),
+            util::fmt_bytes(free),
+            s.buffer_minutes,
+            util::fmt_bytes(need),
+            if same_disk { " и столько же на клип" } else { "" }
+        )
+    })
+}
+
+/// The "Место для буфера" row.
+fn buffer_dir_value(s: &Settings, monitors: &[MonitorInfo], used: u64) -> Vec<Span<'static>> {
+    let root = util::buffer_root(&s.buffer_dir);
+    let name = match &s.buffer_dir {
+        None => format!("Папка Windows ({})", util::drive_of(&root)),
+        Some(d) => d.display().to_string(),
+    };
+    let mut v = vec![Span::raw(format!("‹ {name} ›"))];
+    match util::free_space(&root) {
+        Some(free) if space_warning(s, monitors, used).is_some() => {
+            v.push(Span::styled(format!("  свободно {} — мало", util::fmt_bytes(free + used)), Style::new().fg(WARN)))
+        }
+        Some(free) => v.push(Span::styled(format!("  свободно {}", util::fmt_bytes(free + used)), Style::new().fg(MUTED))),
+        None => v.push(Span::styled("  папка недоступна", Style::new().fg(WARN))),
+    }
+    v
 }
 
 /// The "Обновление" row: current version and what the updater is doing.
@@ -1105,6 +1194,8 @@ fn hint(f: F) -> &'static str {
         F::XColor => "Цвет прицела.",
         F::HkCross => "Включить или выключить прицел из любой игры.",
         F::Autostart => "Запускать Rewind при входе в Windows, сразу свёрнутым в трей.",
+        F::VideoCodec => "HEVC — файлы вдвое меньше. Для просмотра в Windows может понадобиться расширение HEVC.",
+        F::BufferDir => "←→ — выбрать диск, Enter — любую папку. Лучше быстрый диск с запасом места.",
         F::SaveSound => "Короткий сигнал после сохранения — слышно и в полноэкранной игре. В запись не попадает.",
         F::CheckUpdates => "Раз в несколько часов проверять, вышла ли новая версия, и сообщать об этом.",
         F::Update => "Enter — проверить сейчас или установить новую версию; Rewind перезапустится обновлённым.",

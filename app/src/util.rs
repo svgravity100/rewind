@@ -27,8 +27,45 @@ pub fn settings_path() -> PathBuf {
     }
 }
 
-pub fn temp_root() -> PathBuf {
-    std::env::temp_dir().join("ReplayBuffer")
+/// Where the buffer's files go: a "RewindBuffer" folder in the chosen place,
+/// or the Windows temp folder when none is chosen.
+pub fn buffer_root(dir: &Option<PathBuf>) -> PathBuf {
+    match dir {
+        Some(d) => d.join("RewindBuffer"),
+        None => std::env::temp_dir().join("ReplayBuffer"),
+    }
+}
+
+/// Free space (bytes) on the disk holding `path` (or its nearest existing parent).
+pub fn free_space(path: &Path) -> Option<u64> {
+    let mut p = path;
+    while !p.exists() {
+        p = p.parent()?;
+    }
+    let mut free = 0u64;
+    let w = windows::core::HSTRING::from(p.as_os_str());
+    unsafe { windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(&w, Some(&mut free), None, None).ok()? };
+    Some(free)
+}
+
+/// Fixed (internal) disks: "C:\", "D:\" …
+pub fn fixed_drives() -> Vec<PathBuf> {
+    use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+    let mask = unsafe { GetLogicalDrives() };
+    (0..26u8)
+        .filter(|i| mask & (1 << i) != 0)
+        .map(|i| PathBuf::from(format!("{}:\\", (b'A' + i) as char)))
+        .filter(|root| unsafe { GetDriveTypeW(&windows::core::HSTRING::from(root.as_os_str())) } == 3) // DRIVE_FIXED
+        .collect()
+}
+
+/// "C:" for a path on C: (or the start of the path when it has no drive letter).
+pub fn drive_of(path: &Path) -> String {
+    let s = path.display().to_string();
+    match s.get(..2) {
+        Some(d) if d.ends_with(':') => d.to_uppercase(),
+        _ => s,
+    }
 }
 
 /// Local time as "2026-11-04 13-45-10".

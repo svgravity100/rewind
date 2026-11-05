@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
+use crate::settings::Codec;
 use std::mem::ManuallyDrop;
 use crossbeam_channel::{Receiver, Sender};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
@@ -114,22 +115,27 @@ pub struct VideoSegWriter {
 unsafe impl Send for VideoSegWriter {}
 
 impl VideoSegWriter {
-    pub fn create(path: &Path, w: u32, h: u32, fps: u32, bitrate: u32) -> Result<Self, String> {
-        Self::create_with(path, w, h, fps, bitrate, true, None).or_else(|_| Self::create_with(path, w, h, fps, bitrate, false, None))
+    pub fn create(path: &Path, w: u32, h: u32, fps: u32, bitrate: u32, codec: Codec) -> Result<Self, String> {
+        Self::create_with(path, w, h, fps, bitrate, codec, true, None).or_else(|_| Self::create_with(path, w, h, fps, bitrate, codec, false, None))
     }
 
     /// A writer that takes NV12 video-card textures (see `gpu`), hardware encoder only.
-    pub fn create_gpu(path: &Path, w: u32, h: u32, fps: u32, bitrate: u32, d3d: &IMFDXGIDeviceManager) -> Result<Self, String> {
-        Self::create_with(path, w, h, fps, bitrate, true, Some(d3d))
+    pub fn create_gpu(path: &Path, w: u32, h: u32, fps: u32, bitrate: u32, codec: Codec, d3d: &IMFDXGIDeviceManager) -> Result<Self, String> {
+        Self::create_with(path, w, h, fps, bitrate, codec, true, Some(d3d))
     }
 
-    fn create_with(path: &Path, w: u32, h: u32, fps: u32, bitrate: u32, hw: bool, d3d: Option<&IMFDXGIDeviceManager>) -> Result<Self, String> {
+    #[allow(clippy::too_many_arguments)]
+    fn create_with(path: &Path, w: u32, h: u32, fps: u32, bitrate: u32, codec: Codec, hw: bool, d3d: Option<&IMFDXGIDeviceManager>) -> Result<Self, String> {
         startup()?;
         unsafe {
             let sw = sink_writer(path, hw, d3d).map_err(e("Запись MP4"))?;
-            let out = video_type(&MFVideoFormat_H264, w, h, fps).map_err(e("H.264"))?;
-            out.SetUINT32(&MF_MT_AVG_BITRATE, bitrate).map_err(e("H.264"))?;
-            out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32).map_err(e("H.264"))?;
+            let (subtype, profile, name) = match codec {
+                Codec::H264 => (MFVideoFormat_H264, eAVEncH264VProfile_High.0 as u32, "H.264"),
+                Codec::Hevc => (MFVideoFormat_HEVC, eAVEncH265VProfile_Main_420_8.0 as u32, "HEVC"),
+            };
+            let out = video_type(&subtype, w, h, fps).map_err(e(name))?;
+            out.SetUINT32(&MF_MT_AVG_BITRATE, bitrate).map_err(e(name))?;
+            out.SetUINT32(&MF_MT_MPEG2_PROFILE, profile).map_err(e(name))?;
             let _ = out.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, fps);
             let stream = sw.AddStream(&out).map_err(e("H.264"))?;
             let inp = video_type(&MFVideoFormat_NV12, w, h, fps).map_err(e("NV12"))?;
@@ -168,10 +174,10 @@ impl VideoSegWriter {
 
 /// Check that this PC can encode H.264 at the chosen size and frame rate
 /// (writes a tiny file).
-pub fn probe(dir: &Path, w: u32, h: u32, fps: u32, bitrate: u32) -> Result<(), String> {
+pub fn probe(dir: &Path, w: u32, h: u32, fps: u32, bitrate: u32, codec: Codec) -> Result<(), String> {
     let _ = std::fs::create_dir_all(dir);
     let p = dir.join("probe.mp4");
-    let mut v = VideoSegWriter::create(&p, w, h, fps, bitrate)?;
+    let mut v = VideoSegWriter::create(&p, w, h, fps, bitrate, codec)?;
     let frame = vec![128u8; (w * h * 3 / 2) as usize];
     for i in 0..3 {
         v.write(&frame, i)?;
@@ -181,7 +187,9 @@ pub fn probe(dir: &Path, w: u32, h: u32, fps: u32, bitrate: u32) -> Result<(), S
     r
 }
 
-pub fn bitrate(w: u32, h: u32, fps: u32, q: crate::settings::Quality) -> u32 {
+pub fn bitrate(w: u32, h: u32, fps: u32, q: crate::settings::Quality, codec: Codec) -> u32 {
+    // HEVC needs about 60 % of the bits for the same picture.
+    let codec_factor = if codec == Codec::Hevc { 0.6 } else { 1.0 };
     let bpp = match q {
         crate::settings::Quality::Low => 0.08,
         crate::settings::Quality::Medium => 0.15,
@@ -189,7 +197,7 @@ pub fn bitrate(w: u32, h: u32, fps: u32, q: crate::settings::Quality) -> u32 {
     };
     // Higher frame rates need fewer bits per frame (frames are more alike).
     let fps_factor = 30.0 * (fps as f64 / 30.0).powf(0.6);
-    ((w as f64 * h as f64 * fps_factor * bpp) as u32).clamp(1_000_000, 100_000_000)
+    ((w as f64 * h as f64 * fps_factor * bpp * codec_factor) as u32).clamp(1_000_000, 100_000_000)
 }
 
 /// `bgra_to_nv12` split over several threads (needed for 120 fps).

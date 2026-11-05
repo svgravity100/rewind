@@ -65,6 +65,24 @@ impl Quality {
     }
 }
 
+/// Video compression.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Codec {
+    H264,
+    /// H.265: about half the size at the same quality; needs a newer video card.
+    Hevc,
+}
+
+impl Codec {
+    pub const ALL: [Codec; 2] = [Self::H264, Self::Hevc];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264 (везде играет)",
+            Self::Hevc => "HEVC / H.265 (вдвое меньше файлы)",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Format {
     Mp4,
@@ -146,6 +164,9 @@ pub struct Settings {
     pub quality: Quality,
     /// Always MP4 now; AVI is only used automatically when MP4 can't work.
     pub format: Format,
+    pub codec: Codec,
+    /// Where the buffer lives (None: the Windows temp folder, usually on C:).
+    pub buffer_dir: Option<PathBuf>,
     pub monitor: usize,
     /// Game / computer sound (without the voice-chat apps when `chat_track` is on).
     pub system_audio: bool,
@@ -192,6 +213,8 @@ impl Default for Settings {
             resolution: Resolution::P1080,
             quality: Quality::Medium,
             format: Format::Mp4,
+            codec: Codec::H264,
+            buffer_dir: None,
             monitor: 0,
             system_audio: true,
             chat_track: true,
@@ -274,7 +297,7 @@ impl Settings {
     /// Everything that requires restarting the capture when changed.
     pub fn capture_key(&self) -> String {
         format!(
-            "{}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{}",
+            "{}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{}|{:?}|{:?}",
             self.fps,
             self.resolution,
             self.quality,
@@ -283,7 +306,9 @@ impl Settings {
             self.system_audio,
             self.chat_track,
             self.chat_apps,
-            self.microphone
+            self.microphone,
+            self.codec,
+            self.buffer_dir
         )
     }
 }

@@ -28,6 +28,7 @@ windows = { version = "0.58", features = [
     "Win32_Media_Audio",
     "Win32_Devices_Display",
     "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Storage_FileSystem",
 ] }
 wasapi = "0.26"
 crossbeam-channel = "0.5"

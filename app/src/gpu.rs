@@ -280,7 +280,7 @@ pub fn color_test(monitor: &crate::capture::MonitorInfo, dir: &std::path::Path) 
     };
     let mut conv = Converter::new(cap.device(), w, h, w, h, fps)?;
     let gpu_file = dir.join("color-gpu.mp4");
-    let mut v = mf::VideoSegWriter::create_gpu(&gpu_file, w, h, fps, bitrate, &mgr)?;
+    let mut v = mf::VideoSegWriter::create_gpu(&gpu_file, w, h, fps, bitrate, crate::settings::Codec::H264, &mgr)?;
     for i in 0..30 {
         let composed = conv.compose(&src, Some(&pointer));
         v.write_sample(&conv.convert(&composed)?.0, i)?;
@@ -291,7 +291,7 @@ pub fn color_test(monitor: &crate::capture::MonitorInfo, dir: &std::path::Path) 
     let mut nv12 = Vec::new();
     mf::bgra_to_nv12(&cpu_px, w as usize, h as usize, &mut nv12);
     let cpu_file = dir.join("color-cpu.mp4");
-    let mut v = mf::VideoSegWriter::create(&cpu_file, w, h, fps, bitrate)?;
+    let mut v = mf::VideoSegWriter::create(&cpu_file, w, h, fps, bitrate, crate::settings::Codec::H264)?;
     for i in 0..30 {
         v.write(&nv12, i)?;
     }
@@ -317,7 +317,7 @@ pub fn color_test(monitor: &crate::capture::MonitorInfo, dir: &std::path::Path) 
     let mut hconv = Converter::new(cap.device(), w, h, w, h, fps)?;
     hconv.white = white;
     let hdr_file = dir.join("color-hdr.mp4");
-    let mut v = mf::VideoSegWriter::create_gpu(&hdr_file, w, h, fps, bitrate, &mgr)?;
+    let mut v = mf::VideoSegWriter::create_gpu(&hdr_file, w, h, fps, bitrate, crate::settings::Codec::H264, &mgr)?;
     for i in 0..30 {
         let composed = hconv.compose(&hdr_src, Some(&pointer));
         v.write_sample(&hconv.convert(&composed)?.0, i)?;
@@ -361,14 +361,14 @@ fn f16_bits(v: f32) -> u16 {
 
 /// Check the whole GPU path on this PC: capture device, conversion, and the
 /// hardware encoder taking video-card frames (writes a tiny file).
-pub fn probe(monitor: &crate::capture::MonitorInfo, dir: &std::path::Path, w: u32, h: u32, fps: u32, bitrate: u32) -> Result<(), String> {
+pub fn probe(monitor: &crate::capture::MonitorInfo, dir: &std::path::Path, w: u32, h: u32, fps: u32, bitrate: u32, codec: crate::settings::Codec) -> Result<(), String> {
     let cap = Capturer::new(monitor)?;
     let mgr = unsafe { device_manager(cap.device())? };
     let conv = Converter::new(cap.device(), monitor.width, monitor.height, w, h, fps)?;
     let blank = texture(cap.device(), monitor.width, monitor.height, DXGI_FORMAT_B8G8R8A8_UNORM, (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32)?;
     let _ = std::fs::create_dir_all(dir);
     let p = dir.join("probe-gpu.mp4");
-    let mut v = mf::VideoSegWriter::create_gpu(&p, w, h, fps, bitrate, &mgr)?;
+    let mut v = mf::VideoSegWriter::create_gpu(&p, w, h, fps, bitrate, codec, &mgr)?;
     for i in 0..3 {
         let s = conv.convert(&blank)?;
         v.write_sample(&s.0, i)?;
