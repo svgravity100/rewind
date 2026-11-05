@@ -34,14 +34,6 @@ cd app
 cargo build --release
 ```
 
-Установщик и портативный архив (для установщика нужен [Inno Setup 6](https://jrsoftware.org/isinfo.php)):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\package.ps1
-```
-
-GitHub Actions собирает оба пакета при каждом пуше; тег `vX.Y.Z` публикует релиз.
-
 ## Устройство
 
 | Модуль | Что делает |
