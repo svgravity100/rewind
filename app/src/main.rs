@@ -18,7 +18,6 @@ mod overlay;
 mod recorder;
 mod settings;
 mod shell;
-mod sound;
 mod tray;
 mod tui;
 mod update;

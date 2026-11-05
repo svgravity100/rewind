@@ -111,20 +111,14 @@ impl Controller {
         let p = self.pipeline.lock().unwrap();
         let Some(p) = p.as_ref() else {
             crate::notify::post("Буфер выключен", "включите его, чтобы сохранять клипы", false);
-            if s.sound_on_save {
-                crate::sound::failed();
-            }
             let _ = self.events.send(AppEvent::Error("Буфер выключен — включите его, чтобы сохранять моменты".into()));
             return;
         };
         let secs = secs.unwrap_or(s.buffer_minutes as u64 * 60);
-        // Right away, at the key press: the notice and the sound. The notice
-        // changes to "Клип сохранён" when the file is ready.
+        // Right away, at the key press: the notice. It changes to
+        // "Клип сохранён" when the file is ready.
         let len = if secs % 60 == 0 { format!("{} мин", secs / 60) } else { format!("{secs} с") };
         crate::notify::post("Сохраняю клип…", format!("последние {len}"), true);
-        if s.sound_on_save {
-            crate::sound::saved();
-        }
         let out = util::unique_path(&s.output_dir, &format!("Rewind {}", util::stamp()), p.format.ext());
         p.save_last(secs, out, "Клип".into());
     }

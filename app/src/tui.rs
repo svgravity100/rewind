@@ -155,7 +155,6 @@ enum F {
     Autostart,
     CheckUpdates,
     Update,
-    SaveSound,
     VideoCodec,
     BufferDir,
     /// A group heading inside a list (not selectable).
@@ -345,7 +344,6 @@ impl Tui {
                     if let Some(dir) = path.parent().and_then(|d| d.file_name()) {
                         detail.push(dir.to_string_lossy().into_owned());
                     }
-                    // The sound already played when saving started.
                     crate::notify::post(title, detail.join(" · "), true);
                     self.say(text, OK);
                     self.scan_clips();
@@ -353,9 +351,6 @@ impl Tui {
                 AppEvent::Error(e) => {
                     if e.starts_with("Не удалось сохранить") {
                         crate::notify::post("Не удалось сохранить", e.trim_start_matches("Не удалось сохранить").trim_start_matches(':').trim(), false);
-                        if self.settings().sound_on_save {
-                            crate::sound::failed();
-                        }
                     }
                     self.say(e, REC)
                 }
@@ -608,7 +603,6 @@ impl Tui {
             }
             F::Mic => s.microphone = !s.microphone,
             F::CheckUpdates => s.check_updates = !s.check_updates,
-            F::SaveSound => s.sound_on_save = !s.sound_on_save,
             F::Update => {
                 match crate::update::state() {
                     crate::update::State::Available(_) => crate::update::install(),
@@ -1000,7 +994,7 @@ impl Tui {
         }
         self.sel[self.page_idx()] = idx;
         self.num_input = None;
-        let switch = matches!(f, F::SaveSound | F::CheckUpdates | F::Update | F::Autostart | F::Replay | F::Game | F::Chat | F::ChatApp(_) | F::Mic | F::XEnabled);
+        let switch = matches!(f, F::CheckUpdates | F::Update | F::Autostart | F::Replay | F::Game | F::Chat | F::ChatApp(_) | F::Mic | F::XEnabled);
         let rel = col as i32 - (MARK_W + LABEL_W) as i32;
         if rel < 0 {
             // On the label: switches flip, other rows just get selected.
@@ -1099,7 +1093,6 @@ impl Tui {
             F::HkCross => ("Прицел вкл/выкл".into(), hk(s.hk_crosshair, Action::ToggleCrosshair)),
             F::Autostart => ("Запуск с Windows".into(), vec![on(crate::autostart::enabled())]),
             F::CheckUpdates => ("Проверять обновления".into(), vec![on(s.check_updates)]),
-            F::SaveSound => ("Звук при сохранении".into(), vec![on(s.sound_on_save)]),
             F::VideoCodec => ("Кодек".into(), plain(format!("‹ {} ›", s.codec.label()))),
             F::BufferDir => ("Место для буфера".into(), buffer_dir_value(s, &self.ctrl.monitors, self.buffer_used())),
             F::Update => ("Обновление".into(), update_value()),
@@ -1125,7 +1118,6 @@ fn fields(page: Page) -> Vec<F> {
             Group("ЗВУК"),
             Game,
             Mic,
-            SaveSound,
             Group("ПАПКА И КЛАВИШИ"),
             Folder,
             HkSave,
@@ -1231,7 +1223,6 @@ fn hint(f: F) -> &'static str {
         F::Autostart => "Запускать Rewind при входе в Windows, сразу свёрнутым в трей.",
         F::VideoCodec => "HEVC — файлы вдвое меньше. Для просмотра в Windows может понадобиться расширение HEVC.",
         F::BufferDir => "←→ — выбрать диск, Enter — любую папку. Лучше быстрый диск с запасом места.",
-        F::SaveSound => "Короткий сигнал после сохранения — слышно и в полноэкранной игре. В запись не попадает.",
         F::CheckUpdates => "Раз в несколько часов проверять, вышла ли новая версия, и сообщать об этом.",
         F::Update => "Enter — проверить сейчас или установить новую версию; Rewind перезапустится обновлённым.",
         F::Chat | F::ChatApp(_) | F::Group(_) => "",

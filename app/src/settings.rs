@@ -191,8 +191,6 @@ pub struct Settings {
     pub hk_crosshair: Hotkey,
     /// Look for a newer version on GitHub at start-up and every few hours.
     pub check_updates: bool,
-    /// Play a short sound when a clip is saved (or saving failed).
-    pub sound_on_save: bool,
     /// Missing in old files → 0, which triggers the migration in `load`.
     #[serde(default)]
     pub version: u32,
@@ -230,7 +228,6 @@ impl Default for Settings {
             hk_toggle: Hotkey { mods: Mods::CtrlShift, key: 10 },
             hk_crosshair: Hotkey { mods: Mods::CtrlShift, key: 9 },
             check_updates: true,
-            sound_on_save: true,
             version: 2,
         }
     }

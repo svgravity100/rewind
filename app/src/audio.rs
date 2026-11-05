@@ -282,11 +282,6 @@ pub fn run(cfg: AudioConfig, stop: Arc<AtomicBool>, tx: Sender<WriterMsg>, t0: I
         if let Some(s) = &game {
             take(&s.q, n, &mut g, &mut peaks[0]);
         }
-        // Our save chime is in the game sound when the game track leaves out a
-        // chat app instead of this program: drop the game sound while it plays.
-        if crate::sound::muting_game() && (game_fallback || !chats.is_empty()) {
-            g.iter_mut().for_each(|v| *v = 0.0);
-        }
         for (s, _) in chats.values() {
             take(&s.q, n, &mut c, &mut peaks[1]);
         }
