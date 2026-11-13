@@ -13,6 +13,7 @@ mod hdr;
 mod icon;
 mod controller;
 mod mf;
+mod mp4;
 mod notify;
 mod overlay;
 mod recorder;
@@ -64,6 +65,24 @@ fn main() {
             let r = m.register(hk);
             println!("{name} {}: {:?}", h.label(), r);
             let _ = m.unregister(hk);
+        }
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--audio-tracks") {
+        let file = PathBuf::from(args.get(i + 1).cloned().unwrap_or_default());
+        for k in 0..8 {
+            match mf::decode_audio(&file, k) {
+                Ok(v) => println!("track {k}: {:.2} s, peak {}", v.len() as f64 / 2.0 / audio::RATE as f64, v.iter().map(|x| x.unsigned_abs()).max().unwrap_or(0)),
+                Err(_) => break,
+            }
+        }
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--aac-joins") {
+        let dir = PathBuf::from(args.get(i + 1).cloned().unwrap_or_else(|| "shots/joins".into()));
+        match mf::aac_join_test(&dir) {
+            Ok(s) => println!("{s}"),
+            Err(e) => println!("aac test failed: {e}"),
         }
         return;
     }
@@ -319,6 +338,9 @@ fn selftest(secs: u64, dir: PathBuf) {
     if std::env::var_os("RB_HEVC").is_some() {
         s.codec = settings::Codec::Hevc;
     }
+    if std::env::var_os("RB_H264").is_some() {
+        s.codec = settings::Codec::H264;
+    }
     if let Some(d) = std::env::var_os("RB_BUFFER_DIR") {
         s.buffer_dir = Some(PathBuf::from(d));
     }
@@ -356,9 +378,12 @@ fn selftest(secs: u64, dir: PathBuf) {
     for round in 0..rounds {
         let seq = compare && round % 2 == 1;
         mf::SEQUENTIAL.store(seq, Ordering::Relaxed);
+        // RB_AB: odd rounds save through Media Foundation (as before).
+        let one = std::env::var_os("RB_AB").is_some() && round % 2 == 1;
+        mf::NO_COPY.store(one, Ordering::Relaxed);
         let t = std::time::Instant::now();
         ctrl.save_replay(save_secs);
-        let how = if seq { "old (sequential)" } else { "new (parallel)" };
+        let how = if seq { "old (sequential)" } else if one { "media foundation" } else { "new (parallel)" };
         match rx.recv_timeout(Duration::from_secs(300)) {
             Ok(AppEvent::Saved { path, secs, bytes, what, .. }) => {
                 println!("{how} {what}: {} — {secs:.2} s, {bytes} B, saved in {} ms", path.display(), t.elapsed().as_millis())

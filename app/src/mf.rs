@@ -450,8 +450,6 @@ impl Aac {
 
 type AacFrames = Receiver<Result<Mf<IMFSample>, String>>;
 
-/// Encode one sound track of the clip (positions `a0`..`limit`) to AAC,
-/// sending the frames (times relative to the clip start) as they come out.
 /// Where one sound track of the clip comes from in the buffer.
 #[derive(Clone)]
 enum TrackSrc {
@@ -510,54 +508,107 @@ fn track_blocks(path: &Path, src: &TrackSrc, out: &mut dyn FnMut(u64, Vec<u8>)) 
     }
 }
 
-fn encode_track(aac: &Aac, segs: &[&SegRef], src: &TrackSrc, a0: u64, limit: u64, tx: &Sender<Result<Mf<IMFSample>, String>>) -> Result<(), String> {
-    let frame = 1024 * HNS / crate::audio::RATE as i64;
-    let mut k = 0i64;
+/// Samples in one AAC frame.
+const AAC_FRAME: u64 = 1024;
+/// Extra frames a piece encodes before and after its own part, so the
+/// encoder is settled at the joins (their output is thrown away).
+const AAC_ROLL: u64 = 2;
+
+/// One part of a sound track, encoded by its own AAC encoder: frames
+/// `from`..`to` counted from the clip's first sound sample. The last part
+/// runs to the end of the track.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Piece {
+    from: u64,
+    to: u64,
+    last: bool,
+}
+
+/// Cut `frames` AAC frames into `n` pieces of nearly equal length.
+fn pieces(frames: u64, n: usize) -> Vec<Piece> {
+    let n = (n as u64).clamp(1, frames.max(1));
+    let per = frames.div_ceil(n);
+    (0..n)
+        .map(|j| Piece { from: j * per, to: ((j + 1) * per).min(frames), last: j + 1 == n })
+        .filter(|p| p.from < p.to || p.last)
+        .collect()
+}
+
+/// How many pieces each of `tracks` sound tracks is cut into: enough to keep
+/// the processor's cores busy, but no piece shorter than about 15 seconds.
+fn piece_count(tracks: usize, samples: u64) -> usize {
+    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    let by_cores = (cores / tracks.max(1)).max(1);
+    let by_len = (samples / (crate::audio::RATE as u64 * 15)).max(1) as usize;
+    by_cores.min(by_len).min(8)
+}
+
+/// The segments a piece needs: those covering sample positions `lo`..`hi`,
+/// plus one more on each side (sound may sit a little off the picture).
+fn piece_segs<'a>(segs: &[&'a SegRef], fps: i64, lo: u64, hi: u64) -> Vec<&'a SegRef> {
+    let rate = crate::audio::RATE as i64;
+    let pos = |s: &SegRef| (s.base_slot as i64 * rate / fps) as u64;
+    let first = segs.iter().rposition(|s| pos(s) <= lo).unwrap_or(0).saturating_sub(1);
+    let last = segs.iter().position(|s| pos(s) >= hi).map_or(segs.len(), |i| (i + 2).min(segs.len()));
+    segs[first..last.max(first)].to_vec()
+}
+
+/// Encode one piece of a sound track to AAC (the clip's sound starts at
+/// buffer position `a0`; nothing at or after `limit` is used), sending its
+/// frames, stamped with their clip times, as they come out.
+fn encode_piece(aac: &Aac, segs: &[&SegRef], src: &TrackSrc, a0: u64, limit: u64, p: Piece, tx: &Sender<Result<Mf<IMFSample>, String>>) -> Result<(), String> {
+    let frame = AAC_FRAME as i64 * HNS / crate::audio::RATE as i64;
+    let pre = p.from.saturating_sub(AAC_ROLL);
+    let stop = if p.last { limit } else { (a0 + (p.to + AAC_ROLL) * AAC_FRAME).min(limit) };
+    let mut g = pre;
     let mut send = |s: IMFSample| -> Result<(), String> {
-        unsafe {
-            if s.GetSampleTime().is_err() {
-                let _ = s.SetSampleTime(k * frame);
-                let _ = s.SetSampleDuration(frame);
-            }
+        let k = g;
+        g += 1;
+        if k < p.from || (!p.last && k >= p.to) {
+            return Ok(());
         }
-        k += 1;
+        unsafe {
+            let _ = s.SetSampleTime(k as i64 * frame);
+            let _ = s.SetSampleDuration(frame);
+        }
         tx.send(Ok(Mf(s))).map_err(|_| "сохранение прервано".to_string())
     };
-    let mut o = AudioOut::new(a0);
+    let mut o = AudioOut::new(a0 + pre * AAC_FRAME);
     for s in segs {
         track_blocks(&s.audio, src, &mut |pos, data| o.q.push_back((pos, data)))?;
-        o.until(limit, &mut |smp| unsafe { aac.input(&smp, &mut send) })?;
+        o.until(stop, &mut |smp| unsafe { aac.input(&smp, &mut send) })?;
     }
     unsafe { aac.finish(&mut send) }
 }
 
 /// One sound track of the clip being written.
 enum Audio {
-    /// Already-encoded AAC frames coming from an encoder thread.
-    Enc { rx: AacFrames, peek: Option<(i64, IMFSample)>, idx: u32, done: bool },
+    /// Already-encoded AAC frames coming from the encoder threads, one
+    /// channel per piece of the track, taken in order.
+    Enc { rx: VecDeque<AacFrames>, peek: Option<(i64, IMFSample)>, idx: u32 },
     /// PCM, encoded by the file writer itself (when the AAC encoder could not be made).
     Pcm { o: AudioOut, idx: u32 },
 }
 
 impl Audio {
-    /// Write the sound up to `rel` (clip time) / `pos` (buffer sample position).
-    unsafe fn until(&mut self, sw: &IMFSinkWriter, rel: i64, pos: u64) -> Result<(), String> {
+    /// Write the sound up to `rel` (clip time) / `pos` (buffer sample position)
+    /// through `write(stream, sample)`.
+    unsafe fn until(&mut self, write: &mut dyn FnMut(u32, &IMFSample) -> Result<(), String>, rel: i64, pos: u64) -> Result<(), String> {
         match self {
             Audio::Pcm { o, idx } => {
                 let idx = *idx;
-                o.until(pos, &mut |s| sw.WriteSample(idx, &s).map_err(e("Звук")))
+                o.until(pos, &mut |s| write(idx, &s))
             }
-            Audio::Enc { rx, peek, idx, done } => loop {
+            Audio::Enc { rx, peek, idx } => loop {
                 if peek.is_none() {
-                    if *done {
-                        return Ok(());
-                    }
-                    match rx.recv() {
+                    let Some(r) = rx.front() else { return Ok(()) };
+                    match r.recv() {
                         Ok(Ok(Mf(s))) => *peek = Some((s.GetSampleTime().unwrap_or(0), s)),
                         Ok(Err(x)) => return Err(x),
+                        // This piece is done: go on with the next one.
                         Err(_) => {
-                            *done = true;
-                            return Ok(());
+                            rx.pop_front();
+                            continue;
                         }
                     }
                 }
@@ -565,7 +616,7 @@ impl Audio {
                     return Ok(());
                 }
                 let (_, s) = peek.take().unwrap();
-                sw.WriteSample(*idx, &s).map_err(e("Звук"))?;
+                write(*idx, &s)?;
             },
         }
     }
@@ -600,15 +651,249 @@ fn load_segment(s: &SegRef, base: i64, start: i64, end: i64, srcs: &[TrackSrc]) 
     Ok(l)
 }
 
+/// AAC encoders for `ntracks` sound tracks of buffer positions `a0`..`a_end`:
+/// each track is cut into pieces encoded at the same time by their own
+/// encoders (one piece if that many encoders cannot be made).
+fn aac_encoders(ntracks: usize, a0: u64, a_end: u64) -> Option<(Vec<Piece>, Vec<Vec<(Aac, IMFMediaType)>>)> {
+    let samples = a_end.saturating_sub(a0);
+    let make = |n: usize| -> Option<(Vec<Piece>, Vec<Vec<(Aac, IMFMediaType)>>)> {
+        let plan = pieces(samples.div_ceil(AAC_FRAME), n);
+        let encs = (0..ntracks).map(|_| plan.iter().map(|_| unsafe { Aac::new() }.ok()).collect::<Option<Vec<_>>>()).collect::<Option<Vec<_>>>()?;
+        Some((plan, encs))
+    };
+    make(piece_count(ntracks, samples)).or_else(|| make(1))
+}
+
+/// Start the encoder threads of `aac_encoders` (inside scope `sc`); returns
+/// for each track the channels its pieces send frames on, in order.
+fn spawn_encoders<'s, 'e>(
+    sc: &'s std::thread::Scope<'s, 'e>,
+    plan: &[Piece],
+    encs: Vec<Vec<Mf<Aac>>>,
+    segs: &[&'e SegRef],
+    srcs: &[TrackSrc],
+    fps: i64,
+    a0: u64,
+    a_end: u64,
+) -> Vec<VecDeque<AacFrames>> {
+    let mut out = Vec::new();
+    for (track, track_encs) in encs.into_iter().enumerate() {
+        let mut rxs = VecDeque::new();
+        for (&p, aac) in plan.iter().zip(track_encs) {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            rxs.push_back(rx);
+            let lo = a0 + p.from.saturating_sub(AAC_ROLL) * AAC_FRAME;
+            let hi = if p.last { a_end } else { a0 + (p.to + AAC_ROLL) * AAC_FRAME };
+            let segs = piece_segs(segs, fps, lo, hi);
+            let src = srcs[track].clone();
+            sc.spawn(move || {
+                let aac = aac;
+                com_init();
+                if let Err(x) = encode_piece(&aac.0, &segs, &src, a0, a_end, p, &tx) {
+                    let _ = tx.send(Err(x));
+                }
+            });
+        }
+        out.push(rxs);
+    }
+    out
+}
+
 /// Testing only: save the old way (one reader, sound encoded by the writer).
 pub static SEQUENTIAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Testing only: always save through Media Foundation.
+pub static NO_COPY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Join buffer segments into one MP4 for the time range in `spec`.
 ///
-/// Everything runs at once: a few threads read the segments back from disk,
-/// one thread per sound track encodes it to AAC, and this thread writes the
-/// picture and the sound into the file in order. Nothing is re-encoded.
+/// The fast way copies the frames straight from the segment files (see
+/// `mp4`); if a segment is not what it expects, the clip is made again
+/// through Media Foundation.
 pub fn save_mp4(segs: &[SegRef], spec: &crate::avi::ClipSpec, out: &Path) -> Result<crate::avi::ClipResult, String> {
+    if !SEQUENTIAL.load(Ordering::Relaxed) && !NO_COPY.load(Ordering::Relaxed) {
+        match save_copy(segs, spec, out) {
+            Ok(r) => return Ok(r),
+            Err(x) => {
+                eprintln!("fast save failed ({x}), saving through Media Foundation");
+                let _ = std::fs::remove_file(out);
+            }
+        }
+    }
+    save_mf(segs, spec, out)
+}
+
+/// The bytes of a Media Foundation sample.
+unsafe fn sample_bytes(s: &IMFSample) -> Result<Vec<u8>, String> {
+    let buf = s.ConvertToContiguousBuffer().map_err(e("AAC"))?;
+    let mut p: *mut u8 = std::ptr::null_mut();
+    let mut len = 0u32;
+    buf.Lock(&mut p, None, Some(&mut len)).map_err(e("AAC"))?;
+    let v = std::slice::from_raw_parts(p, len as usize).to_vec();
+    buf.Unlock().map_err(e("AAC"))?;
+    Ok(v)
+}
+
+/// Save by copying: segment files are read whole by a few threads, the
+/// sound is encoded to AAC by the piece threads, and this thread writes
+/// frames and sound in order with `mp4::Writer`.
+fn save_copy(segs: &[SegRef], spec: &crate::avi::ClipSpec, out: &Path) -> Result<crate::avi::ClipResult, String> {
+    startup()?;
+    com_init();
+    let prof = std::env::var_os("RB_PROF").is_some();
+    let t_all = std::time::Instant::now();
+    let fps = spec.fps as i64;
+    let abs = |slot: u64| slot as i64 * HNS / fps;
+    let want_start = spec.from_ms as i64 * 10_000;
+    let want_end = spec.to_ms as i64 * 10_000;
+    let segs: Vec<&SegRef> = segs.iter().filter(|s| s.mp4.exists()).collect();
+    if segs.is_empty() {
+        return Err("в буфере ещё нет кадров".into());
+    }
+    let hns = |seg: &crate::mp4::Segment, f: &crate::mp4::Frame| (f.time as i128 * HNS as i128 / seg.timescale as i128) as i64;
+
+    // Start at the last key frame at or before the wanted start; the
+    // segments read for this are kept for the writing.
+    let mut first: Vec<crate::mp4::Segment> = Vec::new();
+    let mut start: Option<i64> = None;
+    let mut first_key: Option<i64> = None;
+    for s in &segs {
+        let seg = crate::mp4::read(&s.mp4)?;
+        let base = abs(s.base_slot);
+        for f in seg.frames.iter().filter(|f| f.key) {
+            let t = base + hns(&seg, f);
+            if t <= want_start {
+                start = Some(t);
+            } else if first_key.is_none() {
+                first_key = Some(t);
+            }
+        }
+        first.push(seg);
+        if first_key.is_some() {
+            break;
+        }
+    }
+    let start = start.or(first_key).ok_or("в буфере ещё нет ключевых кадров")?;
+    let (timescale, stsd) = (first[0].timescale, first[0].stsd.clone());
+    let to_ts = |t: i64| ((t - start) as i128 * timescale as i128 / HNS as i128) as u64;
+
+    let rate = crate::audio::RATE as i64;
+    let a0 = (start * rate / HNS) as u64;
+    let a_end = ((want_end + HNS / fps) * rate / HNS) as u64;
+    let ntracks = spec.audio_tracks as usize;
+    let (plan, encoders) = aac_encoders(ntracks, a0, a_end).ok_or("нет кодировщика AAC")?;
+    let srcs: Vec<TrackSrc> = (0..ntracks).map(|k| track_src(spec, k)).collect();
+
+    let mut w = crate::mp4::Writer::create(out).map_err(|x| format!("Файл MP4: {x}"))?;
+    let v = w.add_video(stsd.clone(), timescale, (timescale as i64 / fps).max(1) as u32);
+    let mut audio: Vec<Audio> = (0..ntracks)
+        .map(|_| Audio::Enc { rx: VecDeque::new(), peek: None, idx: w.add_aac(crate::audio::RATE, 2) as u32 })
+        .collect();
+    let encs: Vec<Vec<Mf<Aac>>> = encoders.into_iter().map(|t| t.into_iter().map(|(a, _)| Mf(a)).collect()).collect();
+
+    let mut frames = 0u64;
+    let mut last_t = start;
+    let mut t_wait = std::time::Duration::ZERO;
+    let mut t_audio = std::time::Duration::ZERO;
+    let n_first = first.len();
+    let rest = segs.len() - n_first;
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(2, 4).min(rest.max(1));
+    let next = AtomicUsize::new(n_first);
+    let slots: Vec<_> = (0..segs.len()).map(|_| crossbeam_channel::bounded::<Result<crate::mp4::Segment, String>>(1)).collect();
+    let (ticket_tx, ticket_rx) = crossbeam_channel::unbounded::<()>();
+    for _ in 0..workers + 1 {
+        let _ = ticket_tx.send(());
+    }
+    let aac_frame = AAC_FRAME as f64 * HNS as f64 / rate as f64;
+    std::thread::scope(|sc| -> Result<(), String> {
+        for (a, rxs) in audio.iter_mut().zip(spawn_encoders(sc, &plan, encs, &segs, &srcs, fps, a0, a_end)) {
+            if let Audio::Enc { rx, .. } = a {
+                *rx = rxs;
+            }
+        }
+        for _ in 0..workers {
+            let (next, slots, segs, rx) = (&next, &slots, &segs, ticket_rx.clone());
+            sc.spawn(move || {
+                while rx.recv().is_ok() {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(s) = segs.get(i) else { break };
+                    let _ = slots[i].0.send(crate::mp4::read(&s.mp4));
+                }
+            });
+        }
+        drop(ticket_rx);
+        // Owned here: an early return drops it, which stops the readers.
+        let ticket_tx = ticket_tx;
+        let mut first = first.into_iter();
+        let write_audio = |w: &mut crate::mp4::Writer, i: u32, s: &IMFSample| -> Result<(), String> {
+            let k = (unsafe { s.GetSampleTime() }.unwrap_or(0) as f64 / aac_frame).round() as u64;
+            let data = unsafe { sample_bytes(s) }?;
+            w.write(i as usize, &data, k * AAC_FRAME, true).map_err(|x| format!("Запись клипа: {x}"))
+        };
+        for (i, s) in segs.iter().enumerate() {
+            let seg = match first.next() {
+                Some(seg) => seg,
+                None => {
+                    let tw = std::time::Instant::now();
+                    let seg = slots[i].1.recv().map_err(|_| "сбой чтения буфера".to_string())??;
+                    t_wait += tw.elapsed();
+                    let _ = ticket_tx.send(());
+                    seg
+                }
+            };
+            if seg.timescale != timescale || seg.stsd != stsd {
+                return Err("части буфера записаны с разными настройками".into());
+            }
+            let base = abs(s.base_slot);
+            for f in &seg.frames {
+                let t = base + hns(&seg, f);
+                if t > want_end {
+                    break;
+                }
+                if t < start {
+                    continue;
+                }
+                w.write(v, &seg.data[f.off..f.off + f.size as usize], to_ts(t), f.key).map_err(|x| format!("Запись клипа: {x}"))?;
+                frames += 1;
+                last_t = last_t.max(t);
+                // Keep the sound interleaved with the picture.
+                let ta = std::time::Instant::now();
+                for a in audio.iter_mut() {
+                    unsafe { a.until(&mut |i, smp| write_audio(&mut w, i, smp), t - start, (t * rate / HNS) as u64)? };
+                }
+                t_audio += ta.elapsed();
+            }
+        }
+        let end = last_t + HNS / fps;
+        for a in audio.iter_mut() {
+            unsafe { a.until(&mut |i, smp| write_audio(&mut w, i, smp), end - start, (end * rate / HNS) as u64)? };
+        }
+        Ok(())
+    })?;
+    drop(audio);
+    if frames == 0 {
+        return Err("в буфере нет кадров для клипа".into());
+    }
+    let tf = std::time::Instant::now();
+    let bytes = w.finish().map_err(|x| format!("Запись клипа: {x}"))?;
+    if prof {
+        println!(
+            "prof copy: total {:?}, waiting for readers {t_wait:?}, audio {t_audio:?}, finish {:?}, readers {workers}, aac threads {}",
+            t_all.elapsed(),
+            tf.elapsed(),
+            ntracks * plan.len()
+        );
+    }
+    let length_frames = ((last_t - start) * fps / HNS) as u64 + 1;
+    Ok(crate::avi::ClipResult { frames: length_frames, bytes, truncated: false })
+}
+
+/// Join buffer segments into one MP4 through Media Foundation.
+///
+/// Everything runs at once: a few threads read the segments back from disk,
+/// the sound is encoded to AAC by the piece threads, and this thread writes
+/// the picture and the sound into the file in order. Nothing is re-encoded.
+fn save_mf(segs: &[SegRef], spec: &crate::avi::ClipSpec, out: &Path) -> Result<crate::avi::ClipResult, String> {
     startup()?;
     com_init();
     let fps = spec.fps as i64;
@@ -654,7 +939,7 @@ pub fn save_mp4(segs: &[SegRef], spec: &crate::avi::ClipSpec, out: &Path) -> Res
     let a_end = ((want_end + HNS / fps) * rate / HNS) as u64;
     let ntracks = spec.audio_tracks as usize;
     let seq = SEQUENTIAL.load(Ordering::Relaxed);
-    let encoders: Option<Vec<(Aac, IMFMediaType)>> = if seq { None } else { (0..ntracks).map(|_| unsafe { Aac::new() }.ok()).collect() };
+    let encoders = if seq { None } else { aac_encoders(ntracks, a0, a_end) };
 
     unsafe {
         let sw = sink_writer(out, true, None).map_err(e("Файл MP4"))?;
@@ -662,15 +947,17 @@ pub fn save_mp4(segs: &[SegRef], spec: &crate::avi::ClipSpec, out: &Path) -> Res
         sw.SetInputMediaType(vidx, &video_type, None).map_err(e("Видео"))?;
         // One AAC stream per sound track, in the clip's track order.
         let mut audio: Vec<Audio> = Vec::new();
-        let mut encs: Vec<(Mf<Aac>, Sender<Result<Mf<IMFSample>, String>>)> = Vec::new();
+        let mut encs: Vec<Vec<Mf<Aac>>> = Vec::new();
+        let mut plan = Vec::new();
         match encoders {
-            Some(list) => {
-                for (aac, ty) in list {
-                    let a = sw.AddStream(&ty).map_err(e("AAC"))?;
-                    sw.SetInputMediaType(a, &ty, None).map_err(e("AAC"))?;
-                    let (tx, rx) = crossbeam_channel::unbounded();
-                    audio.push(Audio::Enc { rx, peek: None, idx: a, done: false });
-                    encs.push((Mf(aac), tx));
+            Some((p, list)) => {
+                plan = p;
+                for track_encs in list {
+                    let ty = &track_encs[0].1;
+                    let a = sw.AddStream(ty).map_err(e("AAC"))?;
+                    sw.SetInputMediaType(a, ty, None).map_err(e("AAC"))?;
+                    audio.push(Audio::Enc { rx: VecDeque::new(), peek: None, idx: a });
+                    encs.push(track_encs.into_iter().map(|(aac, _)| Mf(aac)).collect());
                 }
             }
             None => {
@@ -692,6 +979,7 @@ pub fn save_mp4(segs: &[SegRef], spec: &crate::avi::ClipSpec, out: &Path) -> Res
         let mut frames = 0u64;
         let mut last_t = start;
         let mut t_wait = std::time::Duration::ZERO;
+        let mut t_audio = std::time::Duration::ZERO;
         let workers = if seq { 1 } else { std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(2, 4).min(segs.len()) };
         let next = AtomicUsize::new(0);
         let slots: Vec<_> = (0..segs.len()).map(|_| crossbeam_channel::bounded::<Result<Loaded, String>>(1)).collect();
@@ -700,16 +988,10 @@ pub fn save_mp4(segs: &[SegRef], spec: &crate::avi::ClipSpec, out: &Path) -> Res
             let _ = ticket_tx.send(());
         }
         std::thread::scope(|sc| -> Result<(), String> {
-            for (k, (aac, tx)) in encs.into_iter().enumerate() {
-                let segs = &segs;
-                let src = srcs[k].clone();
-                sc.spawn(move || {
-                    let aac = aac;
-                    com_init();
-                    if let Err(x) = encode_track(&aac.0, segs, &src, a0, a_end, &tx) {
-                        let _ = tx.send(Err(x));
-                    }
-                });
+            for (a, rxs) in audio.iter_mut().zip(spawn_encoders(sc, &plan, encs, &segs, &srcs, fps, a0, a_end)) {
+                if let Audio::Enc { rx, .. } = a {
+                    *rx = rxs;
+                }
             }
             // Readers stay a few segments ahead of the writing.
             for _ in 0..workers {
@@ -744,15 +1026,17 @@ pub fn save_mp4(segs: &[SegRef], spec: &crate::avi::ClipSpec, out: &Path) -> Res
                     sw.WriteSample(vidx, &smp).map_err(e("Видео"))?;
                     frames += 1;
                     last_t = last_t.max(t);
+                    let ta = std::time::Instant::now();
                     // Keep the sound interleaved with the picture.
                     for a in audio.iter_mut() {
-                        a.until(&sw, t - start, (t * rate / HNS) as u64)?;
+                        a.until(&mut |i, s| sw.WriteSample(i, s).map_err(e("Звук")), t - start, (t * rate / HNS) as u64)?;
                     }
+                    t_audio += ta.elapsed();
                 }
             }
             let end = last_t + HNS / fps;
             for a in audio.iter_mut() {
-                a.until(&sw, end - start, (end * rate / HNS) as u64)?;
+                a.until(&mut |i, s| sw.WriteSample(i, s).map_err(e("Звук")), end - start, (end * rate / HNS) as u64)?;
             }
             Ok(())
         })?;
@@ -761,10 +1045,10 @@ pub fn save_mp4(segs: &[SegRef], spec: &crate::avi::ClipSpec, out: &Path) -> Res
         sw.Finalize().map_err(e("Завершение MP4"))?;
         if prof {
             println!(
-                "prof: total {:?}, waiting for readers {t_wait:?}, finalize {:?}, readers {workers}, aac threads {}",
+                "prof: total {:?}, waiting for readers {t_wait:?}, audio {t_audio:?}, finalize {:?}, readers {workers}, aac threads {}",
                 t_all.elapsed(),
                 tf.elapsed(),
-                if reader_tracks == 0 { ntracks } else { 0 }
+                if reader_tracks == 0 { ntracks * plan.len() } else { 0 }
             );
         }
         let bytes = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
@@ -939,6 +1223,17 @@ mod tests {
     /// "Всё вместе" made at saving time is the weighted sum of the stored
     /// tracks, block by block, clamped to 16 bits.
     #[test]
+    fn pieces_cover_every_frame_once() {
+        for (frames, n) in [(10u64, 3usize), (9, 3), (2, 5), (0, 3), (5000, 4)] {
+            let p = super::pieces(frames, n);
+            assert!(p.last().unwrap().last);
+            assert_eq!(p[0].from, 0);
+            assert!(p.windows(2).all(|w| w[0].to == w[1].from && !w[0].last));
+            assert_eq!(p.last().unwrap().to, frames);
+        }
+    }
+
+    #[test]
     fn mix_is_summed_from_stored_tracks() {
         use super::{track_blocks, TrackSrc};
         use crate::avi::{write_record, KIND_AUDIO};
@@ -1003,4 +1298,114 @@ mod tests {
         assert_eq!(got.last().unwrap().2, 2);
         assert!(got.iter().any(|g| g.2 == 0), "silence expected in the gap: {got:?}");
     }
+}
+
+/// All PCM (16-bit stereo, interleaved) of sound stream `stream` of a file.
+pub fn decode_audio(p: &Path, stream: u32) -> Result<Vec<i16>, String> {
+    startup()?;
+    unsafe {
+        let r = MFCreateSourceReaderFromURL(&HSTRING::from(p.as_os_str()), None).map_err(e("open"))?;
+        let _ = r.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false);
+        // Stream numbers count all streams; find the `stream`-th sound one.
+        let mut idx = None;
+        let mut k = 0;
+        for i in 0..16u32 {
+            let Ok(t) = r.GetNativeMediaType(i, 0) else { break };
+            if t.GetGUID(&MF_MT_MAJOR_TYPE).ok() == Some(MFMediaType_Audio) {
+                if k == stream {
+                    idx = Some(i);
+                    break;
+                }
+                k += 1;
+            }
+        }
+        let idx = idx.ok_or("нет такой дорожки")?;
+        r.SetStreamSelection(idx, true).map_err(e("select"))?;
+        r.SetCurrentMediaType(idx, None, &pcm_type().map_err(e("t"))?).map_err(e("pcm"))?;
+        let mut out = Vec::new();
+        loop {
+            let mut flags = 0u32;
+            let mut s: Option<IMFSample> = None;
+            r.ReadSample(idx, 0, None, Some(&mut flags), None, Some(&mut s)).map_err(e("read"))?;
+            if let Some(s) = s {
+                let b = sample_bytes(&s)?;
+                out.extend(b.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])));
+            }
+            if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Testing: encode a tone in one piece and in several, decode both and
+/// report how far apart they are, at the joins and elsewhere.
+pub fn aac_join_test(dir: &Path) -> Result<String, String> {
+    startup()?;
+    com_init();
+    std::fs::create_dir_all(dir).map_err(|x| x.to_string())?;
+    let rate = crate::audio::RATE as u64;
+    let fps = 60i64;
+    // Three 10-second buffer files of 10 ms blocks: 440 Hz plus a quieter 3 kHz.
+    let mut segs = Vec::new();
+    for i in 0..3u64 {
+        let path = dir.join(format!("seg{i}.buf"));
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&path).map_err(|x| x.to_string())?);
+        for b in 0..1000u64 {
+            let pos = i * 10 * rate + b * rate / 100;
+            let data: Vec<u8> = (0..rate / 100)
+                .flat_map(|j| {
+                    let t = (pos + j) as f64 / rate as f64;
+                    let v = ((t * 440.0 * std::f64::consts::TAU).sin() * 8000.0 + (t * 3000.0 * std::f64::consts::TAU).sin() * 3000.0) as i16;
+                    let b = v.to_le_bytes();
+                    [b[0], b[1], b[0], b[1]]
+                })
+                .collect();
+            crate::avi::write_record(&mut f, crate::avi::KIND_AUDIO, pos, &data).map_err(|x| x.to_string())?;
+        }
+        drop(f);
+        segs.push(SegRef { mp4: PathBuf::new(), audio: path, base_slot: i * 600 });
+    }
+    let refs: Vec<&SegRef> = segs.iter().collect();
+    let (a0, a_end) = (rate / 2, 29 * rate);
+    let src = TrackSrc::Stored(0);
+    let frames = (a_end - a0).div_ceil(AAC_FRAME);
+    let mut decoded = Vec::new();
+    let mut joins = Vec::new();
+    for n in [1usize, 3] {
+        let plan = pieces(frames, n);
+        joins = plan.iter().skip(1).map(|p| p.from * AAC_FRAME).collect::<Vec<_>>();
+        let out = dir.join(format!("pieces{n}.mp4"));
+        let mut w = crate::mp4::Writer::create(&out).map_err(|x| x.to_string())?;
+        let t = w.add_aac(crate::audio::RATE, 2);
+        for p in plan {
+            let (aac, _) = unsafe { Aac::new() }.map_err(e("AAC"))?;
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let ps = piece_segs(&refs, fps, a0 + p.from.saturating_sub(AAC_ROLL) * AAC_FRAME, if p.last { a_end } else { a0 + (p.to + AAC_ROLL) * AAC_FRAME });
+            encode_piece(&aac, &ps, &src, a0, a_end, p, &tx)?;
+            drop(tx);
+            for s in rx.iter() {
+                let s = s?.0;
+                let k = (unsafe { s.GetSampleTime() }.unwrap_or(0) as f64 / (AAC_FRAME as f64 * HNS as f64 / rate as f64)).round() as u64;
+                w.write(t, &unsafe { sample_bytes(&s) }?, k * AAC_FRAME, true).map_err(|x| x.to_string())?;
+            }
+        }
+        w.finish().map_err(|x| x.to_string())?;
+        decoded.push(decode_audio(&out, 0)?);
+    }
+    let (a, b) = (&decoded[0], &decoded[1]);
+    let n = a.len().min(b.len()) / 2;
+    let diff = |i: usize| (a[i * 2] as i32 - b[i * 2] as i32).abs();
+    let near = |i: usize| joins.iter().any(|&j| (i as i64 - j as i64).abs() < 4096);
+    let max_join = (0..n).filter(|&i| near(i)).map(diff).max().unwrap_or(0);
+    let max_else = (0..n).filter(|&i| !near(i)).map(diff).max().unwrap_or(0);
+    let peak = a.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
+    Ok(format!(
+        "samples {} / {} (want {}), joins at {:?}, peak {peak}, max diff near joins {max_join}, elsewhere {max_else}",
+        a.len() / 2,
+        b.len() / 2,
+        a_end - a0,
+        joins
+    ))
 }
